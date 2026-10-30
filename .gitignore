@@ -1,0 +1,12 @@
+# Whitelist: everything in this folder stays local unless it is listed below.
+# Local files include the development and local scripts (they contain private
+# code), user data, tests, tools, build output and agent instructions.
+/*
+!/.gitignore
+!/GoogleTranslator.ahk
+!/README.md
+!/README.ru.md
+!/LICENSE
+!/Resources/
+/Resources/IconSource/
+__pycache__/
