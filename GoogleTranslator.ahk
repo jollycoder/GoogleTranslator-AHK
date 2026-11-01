@@ -3438,6 +3438,7 @@ class CyclicDB
             }
         }
 
+        this._Flush(file)
         this.index.Delete(key)
         return true
     }
@@ -3603,6 +3604,7 @@ class CyclicDB
         }
         this.head += recordSize
         this._WriteGlobalHeader(file)
+        this._Flush(file)
 
         return evicted
     }
@@ -3765,8 +3767,10 @@ class CyclicDB
                 bakFile.Seek(rec.offset + CyclicDB.RECORD_HEADER_SIZE + rec.keyLength)
                 if rec.dataLength > 0 && bakFile.RawRead(dataBuf) != rec.dataLength
                     throw Error('failed to read data at offset ' . rec.offset)
-                if this._ComputeCRC(rec.keyBuf, dataBuf) != rec.crc
+                if this._ComputeCRC(rec.keyBuf, dataBuf) != rec.crc {
+                    evictedKeys.Push(rec.key)   ; the key is gone all the same
                     continue
+                }
                 if this.head + rec.size > this.maxSize
                     throw Error('the records do not fit the new size')
                 this._WriteRecordAt(this._file, this.head, rec.keyBuf, dataBuf, rec.crc)
@@ -3778,6 +3782,7 @@ class CyclicDB
                 this.head += rec.size
             }
             this._WriteGlobalHeader(this._file)
+            this._Flush(this._file)
         } finally {
             bakFile.Close()
         }
@@ -3815,7 +3820,9 @@ class CyclicDB
             this._file.Close()
             this._file := ''
         }
-        file := FileOpen(this.path, this._readOnly ? 'r' : 'rw')
+        ; Two writers would overwrite each other's records, so other processes
+        ; may only read (-w). A second copy of the program gets an open error.
+        file := FileOpen(this.path, this._readOnly ? 'r' : 'rw-w')
         if !file
             throw Error('Failed to open database file: ' this.path)
         this._file := file
@@ -3852,6 +3859,17 @@ class CyclicDB
         this.wrapped := file.ReadUChar() != 0
 
         file.Close()
+
+        if this.maxSize < CyclicDB.HEADER_SIZE + CyclicDB.RECORD_HEADER_SIZE
+            return false
+        ; A damaged header must not send the walk, or the next write, into the
+        ; global header or past the end of the ring. A linear ring always
+        ; starts at HEADER_SIZE; in a wrapped one tail lies between head and
+        ; the end of the ring.
+        this.head := Max(CyclicDB.HEADER_SIZE, Min(this.head, this.maxSize))
+        this.tail := this.wrapped
+            ? Max(this.head, Min(this.tail, this.maxSize))
+            : CyclicDB.HEADER_SIZE
 
         ; Now open the persistent handle
         this._OpenFile()
@@ -4026,14 +4044,17 @@ class CyclicDB
             keyBuf := Buffer(keyLength)
             file.RawRead(keyBuf)
             key := StrGet(keyBuf, 'UTF-8')
-            if collect {
-                dataBuf := Buffer(dataLength)
-                if dataLength > 0
-                    file.RawRead(dataBuf)
-                evicted := {key: key, value: dataBuf}
-            }
-            if this.index.Has(key) && this.index[key].offset = this.tail
+            ; Only the copy the index points at is live. An older copy of a
+            ; key written again goes silently: the key itself stays.
+            if this.index.Has(key) && this.index[key].offset = this.tail {
                 this.index.Delete(key)
+                if collect {
+                    dataBuf := Buffer(dataLength)
+                    if dataLength > 0
+                        file.RawRead(dataBuf)
+                    evicted := {key: key, value: dataBuf}
+                }
+            }
         }
 
         this.tail += recordSize
@@ -4075,6 +4096,11 @@ class CyclicDB
         file.Seek(pos)
         this._WriteChecked(file, valueBuf)
     }
+
+    ; File buffers writes and hands them to the OS on Seek, Close or when its
+    ; Handle is read. Flushing after each public write lets a reading process
+    ; see the change and keeps it if this process is killed.
+    _Flush(file) => file.Handle
 
     ; File methods report a short write by their return value, not by throwing.
     _WriteChecked(file, buf) {
