@@ -41,7 +41,7 @@ Right-click the program's tray icon to open the settings menu. The main commands
 | `Languages...` | Change the “native language — second language” pair |
 | `Dark Theme` | Switch between dark and light themes |
 | `Use Multiple GUIs` | Open a separate window for each new translation |
-| `Windowless Mode` | Translate selected text without showing the window and replace the selection with the translation |
+| `Windowless Mode` | Translate selected text without showing the window and replace the selection with the translation. If you switch to another window or field before the translation arrives, it is only copied to the clipboard |
 | `Copy Main Translation` | Automatically copy the main translation to the clipboard |
 | `Add To Startup` | Enable or disable starting the program with Windows |
 | `Clear Cache` | Clear cached translations and speech |

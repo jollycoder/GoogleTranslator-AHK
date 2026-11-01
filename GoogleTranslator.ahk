@@ -14,21 +14,6 @@ if !A_IsCompiled {
 }
 A_IconTip := 'Google Translate ' . Config.VERSION
 
-class LangConfig
-{
-    /*
-    ╔══════════════════════════════════════════════════════════════╗
-    ║                    RUNTIME LANGUAGE PAIR                     ║
-    ║                                                              ║
-    ║ Values come from saved settings or Windows preferences.      ║
-    ║ No user language is assumed when those sources are unclear.  ║
-    ╚══════════════════════════════════════════════════════════════╝
-    */
-
-    static nativeLanguage   := ''
-    static oppositeLanguage := ''
-}
-
 ; Provides ISO 15924 script lists for text and Windows locale names.
 ; Common and inherited characters are deliberately ignored: punctuation and
 ; digits must not influence the translation direction.
@@ -726,8 +711,13 @@ ResolveStrongLanguageMarkers(sourceText, nativeLanguage, oppositeLanguage) {
 ~*c up:: GoogleTranslator.RegisterCopyRelease()
 
 
-class GoogleTranslator extends LangConfig
+class GoogleTranslator
 {
+    ; Set at startup from saved settings or Windows language preferences;
+    ; left empty when neither gives a clear answer (language setup is shown then).
+    static nativeLanguage   := ''
+    static oppositeLanguage := ''
+
     static ready := false
     static copyPressTick := 0
     static copyKeyReleased := true
@@ -832,6 +822,15 @@ class GoogleTranslator extends LangConfig
         text := Trim(text, '`n`r`t ')
         if text == '' {
             return
+        }
+        ; The window may have been closed while a retry was pending.
+        if wnd && !TranslateWindow.IsAlive(wnd) {
+            return
+        }
+        if this.noGui && !wnd && mayRetryDirection {
+            ; Windowless mode pastes the result where the text came from. A
+            ; direction retry (mayRetryDirection=false) keeps that target.
+            this.pasteTarget := this.GetFocusTarget()
         }
         languageSelection := this.ResolveTranslationLanguages(text, tl, sl)
         sl := languageSelection.sourceLanguage
@@ -979,7 +978,7 @@ class GoogleTranslator extends LangConfig
     }
 
     static WebRequestErrorHandler(wnd, errorMsg) {
-        if wnd {
+        if wnd && TranslateWindow.IsAlive(wnd) {
             TranslateWindow.TranslationFailed(wnd)
         }
         for hwnd, gui in TranslateWindow.guis {
@@ -1395,14 +1394,43 @@ class GoogleTranslator extends LangConfig
         }
         if this.noGui && !wnd {
             A_Clipboard := trans
+            if this.PasteTargetChanged() {
+                ; Focus moved while the request was running: a paste now would
+                ; land somewhere else, so the text stays in the clipboard.
+                TrayTip('The active window changed, the translation was copied to the clipboard.',
+                        'Google Translate', 'Iconi')
+                SetTimer () => TrayTip(), -3000
+                return
+            }
             Send '^v'
             return
+        }
+        if wnd && !TranslateWindow.IsAlive(wnd) {
+            return   ; the window was closed while the request was running
         }
         if this.copyTrans {
             A_Clipboard := trans
         }
         (variants && trans .= '`r`n`r`n' . variants)
         return TranslateWindow.ShowTranslation(sl, tl, text, trans, wnd ? wnd : this.multiGUI)
+    }
+
+    ; The window and the control that have the keyboard focus.
+    static GetFocusTarget() {
+        windowHwnd := WinExist('A')
+        focusHwnd := 0
+        if windowHwnd {
+            try focusHwnd := ControlGetFocus(windowHwnd)
+        }
+        return {window: windowHwnd, focus: focusHwnd}
+    }
+
+    static PasteTargetChanged() {
+        if !this.HasOwnProp('pasteTarget') {
+            return false
+        }
+        current := this.GetFocusTarget()
+        return current.window != this.pasteTarget.window || current.focus != this.pasteTarget.focus
     }
 
     static ChooseTranslator(chunks) {
@@ -1418,7 +1446,10 @@ class GoogleTranslator extends LangConfig
     }
 
     static SmartSplit(text, maxLen) {
-        static stops := ['`r`n', '`n', '.', '!', '?', ';', ',', ':', ')', ' ', '$']
+        ; Break points in order of preference. Members of a group are equal,
+        ; so CJK text breaks at its own punctuation as well.
+        static stops := [['`r`n'], ['`n'], ['.', '。', '．'], ['!', '！'], ['?', '？'],
+                         [';', '；'], [',', '，', '、'], [':', '：'], [')', '）'], [' ', '　']]
         chunks := []
         i := 1
         total := StrLen(text)
@@ -1434,29 +1465,32 @@ class GoogleTranslator extends LangConfig
             slice := SubStr(text, i, right - i + 1)
             best := 0
 
-            for stop in stops {
-                if (stop = '$') {
-                    if (right = total) {
-                        best := total
-                        break
-                    }
-                    continue
+            for group in stops {
+                for stop in group {
+                    pos := InStr(slice, stop, false, -1)  ; r‑find
+                    if (pos)
+                        best := Max(best, i + pos + StrLen(stop) - 2)
                 }
-
-                pos := InStr(slice, stop, false, -1)  ; r‑find
-                if (pos) {
-                    best := i + pos + StrLen(stop) - 2
+                if (best)
                     break
-                }
             }
 
             if (!best || best < i)
                 best := right
+            ; Never cut a surrogate pair in two: encodeURIComponent throws on
+            ; a lone half.
+            if (best = right && best > i && this.IsHighSurrogateAt(text, best))
+                best -= 1
 
             chunks.Push(SubStr(text, i, best - i + 1))
             i := best + 1
         }
         return chunks
+    }
+
+    static IsHighSurrogateAt(text, pos) {
+        codeUnit := NumGet(StrPtr(text), (pos - 1) * 2, 'UShort')
+        return codeUnit >= 0xD800 && codeUnit <= 0xDBFF
     }
 
     ; translateHtml receives encoded HTML, so a chunk that is safe by its raw
@@ -1825,7 +1859,7 @@ class TranslateWindow
     static guis := LinkedOrderedMap(), lastGui := ''
          , resizeParams := {wnd: '', height: ''}
          , adjustLayoutTimer := ObjBindMethod(this, 'AdjustLayout', this.resizeParams)
-         , restoreTextTimers := Map()
+         , restoreTextTimers := Map(), restoreTextExpected := Map()
 
     static iniPath => GoogleTranslator.iniPath
 
@@ -1892,13 +1926,20 @@ class TranslateWindow
         if this.lastGui {
             if this.GetNormalWindowPosition(this.lastGui.hwnd, &x, &y) {
                 wnd.Show('x' . (x + 30) . ' y' . (y + 30))
+                this.KeepInWorkArea(wnd.Hwnd)
             } else {
                 wnd.Show()
             }
         } else {
             x := IniRead(this.iniPath, 'Coords', 'GuiX', '')
             y := IniRead(this.iniPath, 'Coords', 'GuiY', '')
-            wnd.Show((x == '' || y == '') ? '' : 'x' . x . ' y' . y)
+            if x == '' || y == '' {
+                wnd.Show()
+            } else {
+                ; The saved position may be on a monitor that is gone now.
+                wnd.Show('x' . x . ' y' . y)
+                this.KeepInWorkArea(wnd.Hwnd)
+            }
         }
         Loop 2 {
             this.SetSelToCB(wnd.lng%A_Index%)
@@ -1954,6 +1995,38 @@ class TranslateWindow
             }
         }
         return true
+    }
+
+    ; Moves a window back into the work area of the nearest monitor when part
+    ; of it is outside: after a cascade of windows, or with a saved position
+    ; on a monitor that has been disconnected.
+    static KeepInWorkArea(windowHwnd) {
+        static MONITORINFO_SIZE := 40, MONITOR_DEFAULTTONEAREST := 2
+        WinGetPos(&x, &y, &width, &height, windowHwnd)
+        monitorHandle := DllCall('User32\MonitorFromWindow', 'Ptr', windowHwnd,
+                                                           'UInt', MONITOR_DEFAULTTONEAREST, 'Ptr')
+        monitorInfo := Buffer(MONITORINFO_SIZE, 0)
+        NumPut('UInt', MONITORINFO_SIZE, monitorInfo)
+        if !monitorHandle
+                || !DllCall('User32\GetMonitorInfoW', 'Ptr', monitorHandle, 'Ptr', monitorInfo, 'Int') {
+            return
+        }
+        workLeft   := NumGet(monitorInfo, 20, 'Int')
+        workTop    := NumGet(monitorInfo, 24, 'Int')
+        workRight  := NumGet(monitorInfo, 28, 'Int')
+        workBottom := NumGet(monitorInfo, 32, 'Int')
+        ; The top-left corner wins when the window is larger than the work area.
+        newX := Max(workLeft, Min(x, workRight - width))
+        newY := Max(workTop, Min(y, workBottom - height))
+        if newX != x || newY != y {
+            WinMove(newX, newY,,, windowHwnd)
+        }
+    }
+
+    ; True while wnd is an open translator window.
+    static IsAlive(wnd) {
+        try return this.guis.Has(wnd.Hwnd)
+        return false
     }
 
     static RemoveGui(hwnd) {
@@ -2043,23 +2116,42 @@ class TranslateWindow
             return
         }
         controlHwnd := ctrl.hwnd
-        if !this.restoreTextTimers.Has(controlHwnd) {
+        ; The text to bring back is taken when the hint first appears, or anew
+        ; when something has replaced the hint in the meantime.
+        if !this.restoreTextTimers.Has(controlHwnd)
+                || !this.restoreTextExpected.Has(controlHwnd)
+                || ctrl.Text !== this.restoreTextExpected[controlHwnd] {
+            this.CancelRestoreTextTimer(controlHwnd)
             this.restoreTextTimers[controlHwnd] := ObjBindMethod(this, 'RestoreText', ctrl, ctrl.Text, controlHwnd)
         }
         turn := wp >> 16 & 0xFFFF
         this.fontSize[editNum] += turn > 0 && turn <= 0x7FFF ? 1 : -1
-        ctrl.Text := GoogleTranslator.fontSizeTranslatedText . ': ' . this.fontSize[editNum] . ' pt'
+        hintText := GoogleTranslator.fontSizeTranslatedText . ': ' . this.fontSize[editNum] . ' pt'
+        ctrl.Text := hintText
+        this.restoreTextExpected[controlHwnd] := hintText
         SetTimer this.restoreTextTimers[controlHwnd], -800
     }
 
+    ; Brings back the text replaced by the font size hint, unless something
+    ; else - a new translation, the user's typing - has replaced the hint.
     static RestoreText(ctrl, originalText, controlHwnd) {
-        try ctrl.Text := originalText
+        hintText := this.restoreTextExpected.Has(controlHwnd)
+            ? this.restoreTextExpected.Delete(controlHwnd)
+            : ''
+        try {
+            if ctrl.Text == hintText {
+                ctrl.Text := originalText
+            }
+        }
         if this.restoreTextTimers.Has(controlHwnd) {
             this.restoreTextTimers.Delete(controlHwnd)
         }
     }
 
     static CancelRestoreTextTimer(controlHwnd) {
+        if this.restoreTextExpected.Has(controlHwnd) {
+            this.restoreTextExpected.Delete(controlHwnd)
+        }
         if !this.restoreTextTimers.Has(controlHwnd) {
             return
         }
@@ -2194,7 +2286,7 @@ class TranslateWindow
     static SetButtonIcon(ctrl, icon, size := 16) {
         static IMAGE_ICON := 1, BM_SETIMAGE := 0xF7
         size := Round(size * A_ScreenDPI / 96)
-        PostMessage BM_SETIMAGE, IMAGE_ICON, Icons.FromBase64(icon, size), ctrl
+        PostMessage BM_SETIMAGE, IMAGE_ICON, Icons.Get(icon, size), ctrl
     }
 
     static GetTextFromField(wnd, fieldNum) {
@@ -2337,9 +2429,10 @@ class TranslateWindow
 
     static ShowAudioLanguageError(wnd, i) {
         currentText := wnd.edit%i%.Text
-        wnd.edit%i%.Text := GoogleTranslator.audioErrorTranslatedText
+        shownText := GoogleTranslator.audioErrorTranslatedText
+        wnd.edit%i%.Text := shownText
         wnd.play%i%.Enabled := false
-        SetTimer ObjBindMethod(this, 'RestoreTextEnablePlay', wnd.edit%i%, currentText, wnd.play%i%), -2000
+        SetTimer ObjBindMethod(this, 'RestoreTextEnablePlay', wnd.edit%i%, currentText, wnd.play%i%, shownText), -2000
     }
 
     static OnAudioError(wnd, i, errorMsg) {
@@ -2361,15 +2454,20 @@ class TranslateWindow
         wnd.stop%i%.Enabled := false
         wnd.play%i%.Enabled := false
         currentText := wnd.edit%i%.Text
-        wnd.edit%i%.Text := errorMsg == 'unsupported language for TTS.'
+        shownText := errorMsg == 'unsupported language for TTS.'
             ? GoogleTranslator.audioErrorTranslatedText
             : 'Playback error: ' . errorMsg
-        SetTimer ObjBindMethod(this, 'RestoreTextEnablePlay', wnd.edit%i%, currentText, wnd.play%i%), -2000
+        wnd.edit%i%.Text := shownText
+        SetTimer ObjBindMethod(this, 'RestoreTextEnablePlay', wnd.edit%i%, currentText, wnd.play%i%, shownText), -2000
     }
 
-    static RestoreTextEnablePlay(editCtrl, text, playCtrl) {
+    ; Brings back the text replaced by an audio error message, unless a new
+    ; translation or the user's typing has replaced the message meanwhile.
+    static RestoreTextEnablePlay(editCtrl, text, playCtrl, shownText) {
         try {
-            editCtrl.Text := text
+            if editCtrl.Text == shownText {
+                editCtrl.Text := text
+            }
             playCtrl.Enabled := true
         }
     }
@@ -2654,13 +2752,17 @@ class AudioChannel
         if !buf {
             urlKey := text . '|' . lang
             if GoogleTranslator.oxfordAudioUrls.Has(urlKey) {
-                try buf := this.wr.Fetch(GoogleTranslator.oxfordAudioUrls[urlKey]).data
-                if buf {
-                    GoogleTranslator.cache.SetAudio(text, lang, buf)
-                    GoogleTranslator.oxfordAudioUrls.Delete(urlKey)
-                } else {
-                    this.state := 'stopped'
+                ; One attempt per link: when it fails, Google TTS speaks the
+                ; text, now and on later presses.
+                oxfordUrl := GoogleTranslator.oxfordAudioUrls.Delete(urlKey)
+                try buf := this.wr.Fetch(oxfordUrl).data
+                if this.state == 'stopped' {
                     return
+                }
+                if buf is Buffer && buf.Size {
+                    GoogleTranslator.cache.SetAudio(text, lang, buf)
+                } else {
+                    buf := ''
                 }
             }
         }
@@ -3234,6 +3336,16 @@ class CyclicDB
     static RECORD_HEADER_SIZE := 12         ; record header size
     static RECORD_MARKER     := 0xFACE      ; record start marker
     static RECORD_DELETED    := 0xDEAD      ; soft-deleted record marker
+    static RECORD_LAP_END    := 0xE0F0      ; end of the older lap (see Set)
+
+    ; Layout. Records run from HEADER_SIZE to head while the ring is linear.
+    ; Once a record does not fit before maxSize, the ring wraps: the end of
+    ; the current lap is marked with RECORD_LAP_END and writing goes on from
+    ; HEADER_SIZE. Then the live records are the older lap, from tail to its
+    ; marker (or the end of the file), followed by the newer one, from
+    ; HEADER_SIZE to head. Bytes after the marker are left over from earlier
+    ; laps. Files written before the marker existed end a lap with such bytes;
+    ; a header there that is not a record is taken for the lap end as well.
 
     path    := ''
     maxSize := 0
@@ -3292,21 +3404,27 @@ class CyclicDB
     ; ── Public API ───────────────────────────────────────────────────────────
 
     ; Soft-delete: overwrites the record marker with RECORD_DELETED.
+    ; An index entry that no longer matches the record at its offset is only
+    ; dropped: writing there would damage the record that lives there now.
     Delete(key) {
         if !this.index.Has(key)
             return false
 
         entry := this.index[key]
         file  := this._file
-        if !file
+        if !file || this._readOnly
             return false
 
-        file.Seek(entry.offset)
-        file.WriteUShort(CyclicDB.RECORD_DELETED)
+        if !this._RecordMatches(file, entry, key) {
+            this.index.Delete(key)
+            return true
+        }
+
+        this._WriteUShortAt(file, entry.offset, CyclicDB.RECORD_DELETED)
 
         ; Zero out payload to wipe sensitive data. Header fields (marker,
         ; keyLength, dataLength, crc) and key bytes are preserved so that
-        ; _BuildIndex and _AdvanceTail can still walk past this record.
+        ; the walk over the ring can still step past this record.
         if entry.dataLength > 0 {
             static CHUNK := 65536, zeros := Buffer(CHUNK, 0)
             file.Seek(entry.offset + CyclicDB.RECORD_HEADER_SIZE + entry.keyLength)
@@ -3434,7 +3552,8 @@ class CyclicDB
     ; If returnEvicted=true, returns Array of {key, value: Buffer} for each evicted record.
     ; Otherwise returns an empty array.
     ; Throws if the record is larger than the ring can ever hold — callers that
-    ; accept untrusted-size input should pre-check with CanStore().
+    ; accept untrusted-size input should pre-check with CanStore() — and when
+    ; the file cannot be written; the index then lists intact records only.
     Set(key, value, returnEvicted := false) {
         keyBuf     := this._StringToUTF8(key)
         keyLength  := keyBuf.Size
@@ -3444,36 +3563,45 @@ class CyclicDB
 
         if recordSize > this.maxSize - CyclicDB.HEADER_SIZE
             throw Error('The record is too large for the database.')
+        if this._readOnly
+            throw Error('The database is open read-only.')
 
         if !FileExist(this.path)
             this._CreateNew()
-
-        if this.head + recordSize > this.maxSize {
-            this.wrapped := true
-            this.head    := CyclicDB.HEADER_SIZE
-        }
-
-        evicted := this._MakeRoom(recordSize, returnEvicted)
-
-        crc  := this._ComputeCRC(keyBuf, dataBuf)
         file := this._file
         if !file
             throw Error('Failed to open file for writing')
 
-        file.Seek(this.head)
-        file.WriteUShort(CyclicDB.RECORD_MARKER)
-        file.WriteUShort(keyLength)
-        file.WriteUInt(dataLength)
-        file.WriteUInt(crc)
-        file.RawWrite(keyBuf)
-        file.RawWrite(dataBuf)
+        evicted    := []
+        oldTail    := this.tail
+        oldWrapped := this.wrapped
 
+        if this.head + recordSize > this.maxSize {
+            ; No room before the end of the file: a new lap starts at the
+            ; beginning. What is left of the older lap is evicted first. Then
+            ; the end of the current lap is marked: the bytes after it are left
+            ; over from earlier laps and must not be read as records.
+            while this.wrapped
+                this._PushEvicted(evicted, this._AdvanceTail(returnEvicted))
+            this._MarkLapEnd(file, this.head)
+            this.wrapped := true
+            this.head    := CyclicDB.HEADER_SIZE
+        }
+        while this.wrapped && this.head + recordSize > this.tail
+            this._PushEvicted(evicted, this._AdvanceTail(returnEvicted))
+
+        ; Persist the eviction before the new record overwrites evicted data:
+        ; after a crash in between, the header points at intact records only.
+        if this.tail != oldTail || this.wrapped != oldWrapped
+            this._WriteGlobalHeader(file)
+
+        this._WriteRecordAt(file, this.head, keyBuf, dataBuf, this._ComputeCRC(keyBuf, dataBuf))
         this.index[key] := {
             offset:     this.head,
             keyLength:  keyLength,
             dataLength: dataLength
         }
-        this.head := this.head + recordSize
+        this.head += recordSize
         this._WriteGlobalHeader(file)
 
         return evicted
@@ -3510,10 +3638,13 @@ class CyclicDB
     ; evicting oldest non-pinned records to fit evictionTargetSize bytes of
     ; live payload (RECORD_HEADER + key + data, summed).
     ; evictionTargetSize=0 means "no eviction, keep everything live".
-    ; Returns {ok: true, evicted: [keys]}.
+    ; Returns {ok: true, evicted: [keys]}. On failure it throws, and the
+    ; database is restored from the backup copy together with its index.
     Compact(newMaxSize, pinnedKeys := [], evictionTargetSize := 0) {
         if newMaxSize < CyclicDB.HEADER_SIZE + CyclicDB.RECORD_HEADER_SIZE
             throw Error('The new size is too small')
+        if this._readOnly
+            throw Error('The database is open read-only.')
 
         ; Empty index — just recreate with the new size.
         if this.index.Count = 0 {
@@ -3537,203 +3668,128 @@ class CyclicDB
                 return {ok: true, evicted: []}
         }
 
-        pinnedSet  := this._KeysToSet(pinnedKeys)
-        bakPath    := this.path . '.bak'
-        oldTail    := this.tail
-        oldHead    := this.head
-        oldWrapped := this.wrapped
-        oldMaxSize := this.maxSize
+        previous := {head: this.head, tail: this.tail, wrapped: this.wrapped, maxSize: this.maxSize}
+        bakPath  := this.path . '.bak'
 
         ; Close the persistent handle before moving the file
         this.Close()
 
         try FileMove(this.path, bakPath, true)
         catch {
-            this._OpenFile()
+            this._Reload()
             throw Error('Compact: failed to move db to .bak')
         }
 
-        bakFile := FileOpen(bakPath, 'r')
-        if !bakFile {
-            try FileMove(bakPath, this.path, true)
-            this._OpenFile()
-            throw Error('Compact: failed to open .bak for reading')
-        }
-
-        ; First pass: scan live records in logical order (oldTail → oldHead),
-        ; skipping soft-deleted. If eviction is needed, decide which non-pinned
-        ; offsets to drop. Oldest non-pinned go first.
-        liveRecords := []   ; [{offset, recordSize, key, pinned}]
-        scanOk       := true
-        pos          := oldTail
-        wrapBackDone := false
-
         try {
-            loop {
-                if !oldWrapped {
-                    if pos >= oldHead
-                        break
-                } else {
-                    ; Wrap-back triggers on either logical end (oldMaxSize)
-                    ; or physical end of data (bakFile.Length, which may be
-                    ; < oldMaxSize if wrap happened before the file was
-                    ; fully grown).
-                    if pos >= oldMaxSize
-                        || pos + CyclicDB.RECORD_HEADER_SIZE > bakFile.Length {
-                        pos := CyclicDB.HEADER_SIZE
-                        wrapBackDone := true
-                    }
-                    if wrapBackDone {
-                        ; Stop the moment we reach head; also handles
-                        ; head == tail (a fully packed ring).
-                        if pos >= oldHead
-                            break
-                    } else {
-                        if pos >= oldHead && pos < oldTail
-                            break
-                    }
-                }
-
-                if pos + CyclicDB.RECORD_HEADER_SIZE > bakFile.Length {
-                    scanOk := false
-                    break
-                }
-
-                bakFile.Seek(pos)
-                marker := bakFile.ReadUShort()
-
-                if marker = CyclicDB.RECORD_DELETED {
-                    keyLength  := bakFile.ReadUShort()
-                    dataLength := bakFile.ReadUInt()
-                    pos        := pos + CyclicDB.RECORD_HEADER_SIZE + keyLength + dataLength
-                    continue
-                }
-                if marker != CyclicDB.RECORD_MARKER {
-                    scanOk := false
-                    break
-                }
-
-                keyLength  := bakFile.ReadUShort()
-                dataLength := bakFile.ReadUInt()
-                bakFile.ReadUInt()   ; crc — verified during the second pass
-                recordSize := CyclicDB.RECORD_HEADER_SIZE + keyLength + dataLength
-
-                if keyLength = 0 || pos + recordSize > bakFile.Length {
-                    scanOk := false
-                    break
-                }
-
-                keyBuf := Buffer(keyLength)
-                bakFile.Seek(pos + CyclicDB.RECORD_HEADER_SIZE)
-                if bakFile.RawRead(keyBuf) != keyLength {
-                    scanOk := false
-                    break
-                }
-                key := StrGet(keyBuf, 'UTF-8')
-
-                liveRecords.Push({
-                    offset:     pos,
-                    recordSize: recordSize,
-                    key:        key,
-                    pinned:     pinnedSet.Has(key)
-                })
-
-                pos += recordSize
-            }
-        }
-
-        if !scanOk {
-            bakFile.Close()
-            try FileMove(bakPath, this.path, true)
-            this._OpenFile()
-            throw Error('Compact: corrupted record encountered during scan')
-        }
-
-        ; Compute skipOffsets: drop oldest non-pinned until total live payload
-        ; fits evictionTargetSize. When evictionTargetSize=0, no eviction.
-        skipOffsets := Map()
-        evictedKeys := []
-        if evictionTargetSize > 0 {
-            totalLive := 0
-            for rec in liveRecords
-                totalLive += rec.recordSize
-
-            for rec in liveRecords {
-                if totalLive <= evictionTargetSize
-                    break
-                if rec.pinned
-                    continue
-                skipOffsets[rec.offset] := true
-                evictedKeys.Push(rec.key)
-                totalLive -= rec.recordSize
-            }
-        }
-
-        ; Second pass: copy surviving records into the new file.
-        this.maxSize := newMaxSize
-        this._CreateNew()   ; reopens _file
-
-        copyOk := true
-        try {
-            for rec in liveRecords {
-                if skipOffsets.Has(rec.offset)
-                    continue
-
-                bakFile.Seek(rec.offset)
-                marker     := bakFile.ReadUShort()
-                keyLength  := bakFile.ReadUShort()
-                dataLength := bakFile.ReadUInt()
-                crc        := bakFile.ReadUInt()
-
-                if marker != CyclicDB.RECORD_MARKER {
-                    copyOk := false
-                    break
-                }
-
-                keyBuf := Buffer(keyLength)
-                if bakFile.RawRead(keyBuf) != keyLength {
-                    copyOk := false
-                    break
-                }
-
-                dataBuf := Buffer(dataLength)
-                if dataLength > 0 && bakFile.RawRead(dataBuf) != dataLength {
-                    copyOk := false
-                    break
-                }
-
-                if this._ComputeCRC(keyBuf, dataBuf) != crc {
-                    copyOk := false
-                    break
-                }
-
-                key := StrGet(keyBuf, 'UTF-8')
-                this._WriteRecordRaw(key, keyBuf, dataBuf, crc)
-            }
-        }
-
-        bakFile.Close()
-
-        if !copyOk {
-            ; Roll back: close the half-written new file, restore .bak.
+            evictedKeys := this._CopyFromBackup(bakPath, previous, newMaxSize,
+                                                this._KeysToSet(pinnedKeys), evictionTargetSize)
+        } catch Error as copyError {
+            ; Roll back: the backup still holds every record.
             this.Close()
             try FileDelete(this.path)
             try FileMove(bakPath, this.path, true)
-            this.maxSize := oldMaxSize
-            this._ReadGlobalHeader()
-            this._BuildIndex()
-            throw Error('Compact: copy failed, database restored from .bak')
+            this.maxSize := previous.maxSize
+            this._Reload()
+            throw Error('Compact: ' . copyError.Message . '; the database was restored from .bak')
         }
 
-        this._WriteGlobalHeader(this._file)
         try FileDelete(bakPath)
-
         return {ok: true, evicted: evictedKeys}
+    }
+
+    ; Copies the live records of the backup file, oldest first, into a new
+    ; database of newMaxSize bytes and returns the keys evicted to fit
+    ; evictionTargetSize. Throws on any read or write error.
+    _CopyFromBackup(bakPath, previous, newMaxSize, pinnedSet, evictionTargetSize) {
+        bakFile := FileOpen(bakPath, 'r')
+        if !bakFile
+            throw Error('failed to open .bak for reading')
+        try {
+            scan := this._ScanHeaders(bakFile, previous.head, previous.tail,
+                                      previous.wrapped, previous.maxSize)
+            ; A damaged header in the older lap only ends that lap (files
+            ; written before lap-end markers end it with leftover bytes); one in
+            ; the newer part would lose records.
+            if scan.badOffset && !scan.badInOldLap
+                throw Error('corrupted record at offset ' . scan.badOffset)
+
+            ; First pass: keys of the live records. A key written again later
+            ; keeps only its newest record.
+            liveRecords := []
+            newestByKey := Map()
+            for rec in scan.records {
+                if rec.deleted
+                    continue
+                keyBuf := Buffer(rec.keyLength)
+                bakFile.Seek(rec.offset + CyclicDB.RECORD_HEADER_SIZE)
+                if bakFile.RawRead(keyBuf) != rec.keyLength
+                    throw Error('failed to read a key at offset ' . rec.offset)
+                rec.keyBuf := keyBuf
+                rec.key    := StrGet(keyBuf, 'UTF-8')
+                rec.pinned := pinnedSet.Has(rec.key)
+                liveRecords.Push(rec)
+                newestByKey[rec.key] := liveRecords.Length
+            }
+            survivors := []
+            totalLive := 0
+            for i, rec in liveRecords {
+                if newestByKey[rec.key] = i {
+                    survivors.Push(rec)
+                    totalLive += rec.size
+                }
+            }
+
+            ; Drop the oldest non-pinned records until the live payload fits
+            ; evictionTargetSize. When evictionTargetSize=0, no eviction.
+            evictedKeys := []
+            skipped     := Map()
+            if evictionTargetSize > 0 {
+                for i, rec in survivors {
+                    if totalLive <= evictionTargetSize
+                        break
+                    if rec.pinned
+                        continue
+                    skipped[i] := true
+                    evictedKeys.Push(rec.key)
+                    totalLive -= rec.size
+                }
+            }
+
+            ; Second pass: copy the surviving records into the new file. A
+            ; record whose checksum fails is dropped instead of copied.
+            this.maxSize := newMaxSize
+            this._CreateNew()   ; reopens _file
+            for i, rec in survivors {
+                if skipped.Has(i)
+                    continue
+                dataBuf := Buffer(rec.dataLength)
+                bakFile.Seek(rec.offset + CyclicDB.RECORD_HEADER_SIZE + rec.keyLength)
+                if rec.dataLength > 0 && bakFile.RawRead(dataBuf) != rec.dataLength
+                    throw Error('failed to read data at offset ' . rec.offset)
+                if this._ComputeCRC(rec.keyBuf, dataBuf) != rec.crc
+                    continue
+                if this.head + rec.size > this.maxSize
+                    throw Error('the records do not fit the new size')
+                this._WriteRecordAt(this._file, this.head, rec.keyBuf, dataBuf, rec.crc)
+                this.index[rec.key] := {
+                    offset:     this.head,
+                    keyLength:  rec.keyLength,
+                    dataLength: rec.dataLength
+                }
+                this.head += rec.size
+            }
+            this._WriteGlobalHeader(this._file)
+        } finally {
+            bakFile.Close()
+        }
+        return evictedKeys
     }
 
     ; ── Private ──────────────────────────────────────────────────────────────
 
     _CreateNew() {
+        if this._readOnly
+            throw Error('The database is open read-only.')
         this.head    := CyclicDB.HEADER_SIZE
         this.tail    := CyclicDB.HEADER_SIZE
         this.wrapped := false
@@ -3804,174 +3860,232 @@ class CyclicDB
     }
 
     _WriteGlobalHeader(file) {
+        static header := Buffer(CyclicDB.HEADER_SIZE)
+        NumPut('UInt',  CyclicDB.MAGIC, 'UChar', CyclicDB.VERSION, 'UInt', this.maxSize,
+               'UInt',  this.head,      'UInt',  this.tail,
+               'UChar', this.wrapped ? 1 : 0, header)
         file.Seek(0)
-        file.WriteUInt(CyclicDB.MAGIC)
-        file.WriteUChar(CyclicDB.VERSION)
-        file.WriteUInt(this.maxSize)
-        file.WriteUInt(this.head)
-        file.WriteUInt(this.tail)
-        file.WriteUChar(this.wrapped ? 1 : 0)
+        this._WriteChecked(file, header)
+    }
+
+    ; Reopens the file at this.path and rebuilds the index from it.
+    _Reload() {
+        this.index := Map()
+        if !this._ReadGlobalHeader()
+            throw Error('Failed to reopen the database file: ' . this.path)
+        this._BuildIndex()
     }
 
     _BuildIndex() {
         this.index := Map()
         file       := this._file
         if !file {
-            this._CreateNew()
+            if !this._readOnly
+                this._CreateNew()
             return
         }
 
-        pos := this.tail
-        wrapBackDone := false
-
-        loop {
-            if !this.wrapped {
-                if pos >= this.head
-                    break
-            } else {
-                ; Wrap-back triggers on either logical end (maxSize) or
-                ; physical end of data (file.Length, which may be < maxSize
-                ; if wrap happened before the file was fully grown).
-                if pos >= this.maxSize
-                    || pos + CyclicDB.RECORD_HEADER_SIZE > file.Length {
-                    pos := CyclicDB.HEADER_SIZE
-                    wrapBackDone := true
-                }
-                if wrapBackDone {
-                    ; In the "second circle" — stop the moment we reach head.
-                    ; This branch also correctly handles head == tail (a fully
-                    ; packed ring), where the legacy condition never fired.
-                    if pos >= this.head
-                        break
-                } else {
-                    if pos >= this.head && pos < this.tail
-                        break
-                }
-            }
-
-            file.Seek(pos)
-
-            if file.Pos + CyclicDB.RECORD_HEADER_SIZE > file.Length {
-                this._CreateNew()
-                return
-            }
-
-            marker := file.ReadUShort()
-            if marker = CyclicDB.RECORD_DELETED {
-                keyLength  := file.ReadUShort()
-                dataLength := file.ReadUInt()
-                pos        := pos + CyclicDB.RECORD_HEADER_SIZE + keyLength + dataLength
+        scan := this._ScanHeaders(file, this.head, this.tail, this.wrapped, this.maxSize)
+        for rec in scan.records {
+            if rec.deleted
+                continue
+            keyBuf  := Buffer(rec.keyLength)
+            dataBuf := Buffer(rec.dataLength)
+            file.Seek(rec.offset + CyclicDB.RECORD_HEADER_SIZE)
+            if file.RawRead(keyBuf) != rec.keyLength
+                || (rec.dataLength > 0 && file.RawRead(dataBuf) != rec.dataLength)
+                || this._ComputeCRC(keyBuf, dataBuf) != rec.crc {
+                ; A damaged record is dropped on its own: its header still
+                ; gives the size, so the records after it stay reachable.
+                if !this._readOnly
+                    try this._WriteUShortAt(file, rec.offset, CyclicDB.RECORD_DELETED)
                 continue
             }
-            if marker != CyclicDB.RECORD_MARKER {
-                this._CreateNew()
-                return
+            this.index[StrGet(keyBuf, 'UTF-8')] := {
+                offset:     rec.offset,
+                keyLength:  rec.keyLength,
+                dataLength: rec.dataLength
             }
+        }
 
+        if !scan.badOffset || this._readOnly
+            return
+        ; Nothing after a damaged header can be walked. In the older lap that
+        ; spot becomes the lap end; in the newer part new records go there.
+        if scan.badInOldLap {
+            try this._WriteUShortAt(file, scan.badOffset, CyclicDB.RECORD_LAP_END)
+        } else {
+            this.head := scan.badOffset
+            try this._WriteGlobalHeader(file)
+        }
+    }
+
+    ; Walks the record headers in logical order, oldest first, without reading
+    ; keys or data. Returns {records, badOffset, badInOldLap}: badOffset is 0
+    ; when the walk reached head, otherwise the offset of the damaged header
+    ; that stopped it.
+    _ScanHeaders(file, head, tail, wrapped, maxSize) {
+        records    := []
+        pos        := tail
+        inOldLap   := wrapped
+        fileLength := file.Length
+        loop {
+            if inOldLap {
+                if this._IsLapEnd(file, pos, maxSize) {
+                    pos      := CyclicDB.HEADER_SIZE
+                    inOldLap := false
+                    continue
+                }
+                limit := Min(maxSize, fileLength)
+            } else {
+                if pos >= head
+                    break
+                limit := Min(head, fileLength)
+            }
+            if pos + CyclicDB.RECORD_HEADER_SIZE > limit
+                return {records: records, badOffset: pos, badInOldLap: inOldLap}
+
+            file.Seek(pos)
+            marker     := file.ReadUShort()
             keyLength  := file.ReadUShort()
             dataLength := file.ReadUInt()
             crc        := file.ReadUInt()
             recordSize := CyclicDB.RECORD_HEADER_SIZE + keyLength + dataLength
+            if (marker != CyclicDB.RECORD_MARKER && marker != CyclicDB.RECORD_DELETED)
+                || keyLength = 0 || pos + recordSize > limit
+                return {records: records, badOffset: pos, badInOldLap: inOldLap}
 
-            if pos + recordSize > file.Length {
-                this._CreateNew()
-                return
-            }
-
-            keyBuf := Buffer(keyLength)
-            file.RawRead(keyBuf)
-            key := StrGet(keyBuf, 'UTF-8')
-
-            dataBuf := Buffer(dataLength)
-            file.RawRead(dataBuf)
-
-            if this._ComputeCRC(keyBuf, dataBuf) != crc {
-                this._CreateNew()
-                return
-            }
-
-            this.index[key] := {
+            records.Push({
                 offset:     pos,
+                deleted:    marker = CyclicDB.RECORD_DELETED,
                 keyLength:  keyLength,
-                dataLength: dataLength
-            }
-
-            pos := pos + recordSize
+                dataLength: dataLength,
+                crc:        crc,
+                size:       recordSize
+            })
+            pos += recordSize
         }
+        return {records: records, badOffset: 0, badInOldLap: false}
     }
 
-    _MakeRoom(recordSize, collect := false) {
-        if !this.wrapped
-            return []
-
-        evicted := []
-        while this.head + recordSize > this.tail {
-            result := this._AdvanceTail(collect)
-            if collect && result != ''
-                evicted.Push(result)
-            if !this.wrapped
-                break
-        }
-        return evicted
+    ; True when no record of the older lap starts at pos.
+    _IsLapEnd(file, pos, maxSize) {
+        if pos + CyclicDB.RECORD_HEADER_SIZE > Min(maxSize, file.Length)
+            return true
+        file.Seek(pos)
+        return file.ReadUShort() = CyclicDB.RECORD_LAP_END
     }
 
+    ; Marks the end of the current lap. Where the marker does not fit, the
+    ; lap ends at the end of the file anyway.
+    _MarkLapEnd(file, pos) {
+        if pos + 2 <= this.maxSize
+            this._WriteUShortAt(file, pos, CyclicDB.RECORD_LAP_END)
+    }
+
+    ; Evicts the oldest record of the older lap and moves tail past it; once
+    ; the older lap is used up, the ring is linear again. Returns
+    ; {key, value: Buffer} for an evicted live record when collect=true.
     _AdvanceTail(collect := false) {
         file := this._file
-        if !file
+        if !file || !this.wrapped
             return ''
+
+        if this._IsLapEnd(file, this.tail, this.maxSize) {
+            this._EndOlderLap()
+            return ''
+        }
 
         file.Seek(this.tail)
-
-        marker := file.ReadUShort()
-        if marker = CyclicDB.RECORD_DELETED {
-            keyLength  := file.ReadUShort()
-            dataLength := file.ReadUInt()
-            this.tail  := this.tail + CyclicDB.RECORD_HEADER_SIZE + keyLength + dataLength
-            return ''
-        }
-        if marker != CyclicDB.RECORD_MARKER {
-            this.tail    := CyclicDB.HEADER_SIZE
-            this.wrapped := false
-            return ''
-        }
-
+        marker     := file.ReadUShort()
         keyLength  := file.ReadUShort()
         dataLength := file.ReadUInt()
         recordSize := CyclicDB.RECORD_HEADER_SIZE + keyLength + dataLength
 
-        file.Seek(this.tail + CyclicDB.RECORD_HEADER_SIZE)
-        keyBuf := Buffer(keyLength)
-        file.RawRead(keyBuf)
-        key := StrGet(keyBuf, 'UTF-8')
+        if (marker != CyclicDB.RECORD_MARKER && marker != CyclicDB.RECORD_DELETED)
+            || keyLength = 0 || this.tail + recordSize > Min(this.maxSize, file.Length) {
+            ; A damaged header ends the older lap: nothing after it can be walked.
+            this._EndOlderLap()
+            return ''
+        }
 
         evicted := ''
-        if collect {
-            dataBuf := Buffer(dataLength)
-            if dataLength > 0
-                file.RawRead(dataBuf)
-            evicted := {key: key, value: dataBuf}
-        }
-
-        if this.index.Has(key) && this.index[key].offset = this.tail
-            this.index.Delete(key)
-
-        this.tail := this.tail + recordSize
-
-        if this.tail >= this.maxSize || (this.tail >= this.head && this.wrapped) {
-            file.Seek(this.tail)
-            if file.Pos + 2 <= file.Length {
-                nextMarker := file.ReadUShort()
-                if nextMarker != CyclicDB.RECORD_MARKER {
-                    this.tail    := CyclicDB.HEADER_SIZE
-                    this.wrapped := false
-                }
-            } else {
-                this.tail    := CyclicDB.HEADER_SIZE
-                this.wrapped := false
+        if marker = CyclicDB.RECORD_MARKER {
+            file.Seek(this.tail + CyclicDB.RECORD_HEADER_SIZE)
+            keyBuf := Buffer(keyLength)
+            file.RawRead(keyBuf)
+            key := StrGet(keyBuf, 'UTF-8')
+            if collect {
+                dataBuf := Buffer(dataLength)
+                if dataLength > 0
+                    file.RawRead(dataBuf)
+                evicted := {key: key, value: dataBuf}
             }
+            if this.index.Has(key) && this.index[key].offset = this.tail
+                this.index.Delete(key)
         }
 
+        this.tail += recordSize
+        if this._IsLapEnd(file, this.tail, this.maxSize)
+            this._EndOlderLap()
         return evicted
+    }
+
+    ; The rest of the older lap is gone: the ring is linear from HEADER_SIZE
+    ; to head. Index entries that still point into the dropped part go too.
+    _EndOlderLap() {
+        dropFrom := this.tail
+        for key, entry in this.index.Clone() {
+            if entry.offset >= dropFrom
+                this.index.Delete(key)
+        }
+        this.tail    := CyclicDB.HEADER_SIZE
+        this.wrapped := false
+    }
+
+    _PushEvicted(evicted, item) {
+        if IsObject(item)
+            evicted.Push(item)
+    }
+
+    _WriteRecordAt(file, pos, keyBuf, dataBuf, crc) {
+        static header := Buffer(CyclicDB.RECORD_HEADER_SIZE)
+        NumPut('UShort', CyclicDB.RECORD_MARKER, 'UShort', keyBuf.Size,
+               'UInt',   dataBuf.Size,           'UInt',   crc, header)
+        file.Seek(pos)
+        this._WriteChecked(file, header)
+        this._WriteChecked(file, keyBuf)
+        this._WriteChecked(file, dataBuf)
+    }
+
+    _WriteUShortAt(file, pos, value) {
+        static valueBuf := Buffer(2)
+        NumPut('UShort', value, valueBuf)
+        file.Seek(pos)
+        this._WriteChecked(file, valueBuf)
+    }
+
+    ; File methods report a short write by their return value, not by throwing.
+    _WriteChecked(file, buf) {
+        if buf.Size > 0 && file.RawWrite(buf) != buf.Size
+            throw Error('Failed to write the database file: ' . this.path)
+    }
+
+    ; True when the record at entry.offset is still the live record of key.
+    _RecordMatches(file, entry, key) {
+        try {
+            if entry.offset + CyclicDB.RECORD_HEADER_SIZE + entry.keyLength > file.Length
+                return false
+            file.Seek(entry.offset)
+            if file.ReadUShort() != CyclicDB.RECORD_MARKER
+                || file.ReadUShort() != entry.keyLength
+                || file.ReadUInt() != entry.dataLength
+                return false
+            keyBuf := Buffer(entry.keyLength)
+            file.Seek(entry.offset + CyclicDB.RECORD_HEADER_SIZE)
+            return file.RawRead(keyBuf) = entry.keyLength && StrGet(keyBuf, 'UTF-8') == key
+        }
+        return false
     }
 
     _ComputeCRC(keyBuf, dataBuf) {
@@ -3993,33 +4107,6 @@ class CyclicDB
         for k in keys
             set[k] := true
         return set
-    }
-
-    ; Append a record directly to the live file at this.head without invoking
-    ; _MakeRoom or rewriting the global header. Caller must guarantee space.
-    ; Used by Compact during the copy pass for performance.
-    _WriteRecordRaw(key, keyBuf, dataBuf, crc) {
-        file := this._file
-        if !file
-            throw Error('Failed to open file for writing')
-
-        recordSize := CyclicDB.RECORD_HEADER_SIZE + keyBuf.Size + dataBuf.Size
-
-        file.Seek(this.head)
-        file.WriteUShort(CyclicDB.RECORD_MARKER)
-        file.WriteUShort(keyBuf.Size)
-        file.WriteUInt(dataBuf.Size)
-        file.WriteUInt(crc)
-        file.RawWrite(keyBuf)
-        if dataBuf.Size > 0
-            file.RawWrite(dataBuf)
-
-        this.index[key] := {
-            offset:     this.head,
-            keyLength:  keyBuf.Size,
-            dataLength: dataBuf.Size
-        }
-        this.head += recordSize
     }
 }
 
@@ -4420,6 +4507,14 @@ class TextCompressor
 
         if (chunksN = 0 && uncTotal != 0)
             throw Error('Decompress: invalid header (chunks=0 but data length>0)')
+        ; The header comes from a file, so its sizes are checked before any
+        ; buffer is allocated from them.
+        if (blockSize = 0 || blockSize > 16 * 1024 * 1024)
+            throw Error('Decompress: invalid block size ' . blockSize)
+        if (chunksN > (sz - off) // 9)
+            throw Error('Decompress: truncated chunk table')
+        if (uncTotal > chunksN * blockSize)
+            throw Error('Decompress: invalid header (data length exceeds the blocks)')
         if (uncTotal = 0)
             return ''
 
@@ -4439,6 +4534,14 @@ class TextCompressor
                 uncLen := NumGet(buf, off, 'UInt') , off += 4
                 cmpLen := NumGet(buf, off, 'UInt') , off += 4
 
+                if (cFlags & ~this.CHUNKFLAG_RAW)
+                    throw Error('Decompress: unsupported chunk flags ' . cFlags)
+                if (uncLen > blockSize)
+                    throw Error('Decompress: chunk larger than the block size')
+                ; A raw chunk is copied as is: both lengths must agree, or the
+                ; copy would read past the payload.
+                if ((cFlags & this.CHUNKFLAG_RAW) && cmpLen != uncLen)
+                    throw Error('Decompress: raw chunk length mismatch')
                 if (off + cmpLen > sz)
                     throw Error('Decompress: truncated chunk payload')
 
@@ -4641,24 +4744,50 @@ class MediaSession
         this.cancelled := false
         this.session := IMFMediaSession.Create(MediaSession.CreateConfiguration())
         this.sourceManager := MediaSourceManager(mediaSource, sourceType, fileType)
-        if !this.InitializeComponents(shouldCancel) {
+        try {
+            built := this.InitializeComponents(shouldCancel)
+        } catch Error as buildError {
+            ; __Delete still shuts the session down: the base is unchanged.
+            this.ReleaseSourceManager()
+            throw buildError
+        }
+        if !built {
+            ; A failed session loses its base, and with it __Delete, so it is
+            ; shut down here: MF requires Shutdown before the last Release.
+            this.ShutdownSession()
             if this.cancelled {
                 MediaSession.lastError := MediaSession.CANCELLED
-                MediaSession.Abandon(this.sourceManager)
-                this.sourceManager := ''
+                this.ReleaseSourceManager()
                 ObjSetBase(this, {})
                 return
             }
             this.ReportError(sourceType, fileType)
             ObjSetBase(this, {})
         }
-        this.sourceManager.Clear()
+        this.ReleaseSourceManager()
     }
 
     ; On a clean exit the OnExit handler may have called MFShutdown already,
     ; in which case Shutdown() returns MF_E_SHUTDOWN (0xC00D3E85). Harmless.
-    __Delete() {
+    __Delete() => this.ShutdownSession()
+
+    ShutdownSession() {
         try this.session.Shutdown()
+    }
+
+    ; Frees the source manager's callback once MF is done with it. A resolve
+    ; still in flight (a cancelled build) leaves it to ReapAbandoned.
+    ReleaseSourceManager() {
+        manager := this.sourceManager
+        this.sourceManager := ''
+        if !manager
+            return
+        if manager.initialized {
+            manager.Clear()
+        } else {
+            manager.Cancel()
+            MediaSession.Abandon(manager)
+        }
     }
 
     /**
@@ -4798,13 +4927,16 @@ class MediaSourceManager
 
     OnAsyncComplete(pAsyncResult) {
         method := 'EndCreateObjectFrom' . (this.sourceType = 'URL' ? 'URL' : 'ByteStream')
-        try this.MediaSource := this.SourceResolver.%method%(pAsyncResult, &MF_OBJECT_TYPE)
-        catch Error as e {
+        ; Any failure has to move `initialized` off false: InitializeComponents
+        ; waits for that, with no deadline of its own.
+        try {
+            this.MediaSource := this.SourceResolver.%method%(pAsyncResult, &MF_OBJECT_TYPE)
+            this.PresentationDescriptor := this.MediaSource.CreatePresentationDescriptor()
+        } catch Error as e {
             this.error := e.Message
             this.initialized := -1
             return
         }
-        this.PresentationDescriptor := this.MediaSource.CreatePresentationDescriptor()
         ; The callback is not freed here - this runs inside its own Invoke.
         ; Clear() does it once the caller is done.
         this.ByteStream := this.SourceResolver := ''
@@ -5145,34 +5277,80 @@ class IMFAsyncCallback {
         this.vtable := this.CreateVTable(userfunc)
         this.ptr := this.vtable.ptr
     }
+    /**
+     * Only Invoke runs script code, marshalled to the script thread. The
+     * other four methods return constants, so they are native stubs shared
+     * by all callbacks and never freed: MF calls Release after Invoke has
+     * returned, possibly after Dispose has run, and a stub that outlives
+     * every callback cannot be pulled out from under that call.
+     */
     CreateVTable(userfunc) {
-        static E_NOINTERFACE := 0x80004002, E_NOTIMPL := 0x80004001
-        methods := [
-            QueryInterface(self, riid, pObj) => E_NOINTERFACE,
-            AddRef(self)  => 1,
-            Release(self) => 1,
-            GetParameters(self, pdwFlags, pdwQueue) => E_NOTIMPL,
-            Invoke(self, pAsyncResult) => userfunc.Call(pAsyncResult)
-        ]
-        vtable := Buffer(A_PtrSize * (methods.Length + 1))
-        NumPut('Ptr', vtable.ptr + A_PtrSize, vtable)
-        for i, method in methods {
-            ; don't use CallbackCreate() here instead of RegisterSyncCallback()
-            pcb := RegisterSyncCallback(method)
-            this.thunks.Push(pcb)
-            NumPut('Ptr', pcb, vtable, A_PtrSize * i)
-        }
+        stubs := IMFAsyncCallback.NativeStubs
+        ; don't use CallbackCreate() here instead of RegisterSyncCallback()
+        pInvoke := RegisterSyncCallback((self, pAsyncResult) => userfunc.Call(pAsyncResult))
+        this.thunks.Push(pInvoke)
+        vtable := Buffer(A_PtrSize * 6)
+        NumPut('Ptr', vtable.ptr + A_PtrSize,
+               'Ptr', stubs.queryInterface, 'Ptr', stubs.addRef, 'Ptr', stubs.release,
+               'Ptr', stubs.getParameters,  'Ptr', pInvoke, vtable)
         return vtable
     }
 
+    ; QueryInterface clears *ppv and returns E_NOINTERFACE, AddRef and Release
+    ; return 1, GetParameters returns E_NOTIMPL. Built once per process.
+    static NativeStubs {
+        get {
+            static stubs := ''
+            if stubs
+                return stubs
+            if A_PtrSize = 8 {
+                code := Map(
+                    'queryInterface', [0x49, 0xC7, 0x00, 0, 0, 0, 0,       ; mov qword [r8], 0
+                                       0xB8, 0x02, 0x40, 0x00, 0x80, 0xC3], ; mov eax, E_NOINTERFACE / ret
+                    'addRef',         [0xB8, 0x01, 0, 0, 0, 0xC3],          ; mov eax, 1 / ret
+                    'release',        [0xB8, 0x01, 0, 0, 0, 0xC3],
+                    'getParameters',  [0xB8, 0x01, 0x40, 0x00, 0x80, 0xC3]  ; mov eax, E_NOTIMPL / ret
+                )
+            } else {
+                code := Map(
+                    'queryInterface', [0x8B, 0x44, 0x24, 0x0C,              ; mov eax, [esp+12]
+                                       0xC7, 0x00, 0, 0, 0, 0,              ; mov dword [eax], 0
+                                       0xB8, 0x02, 0x40, 0x00, 0x80,        ; mov eax, E_NOINTERFACE
+                                       0xC2, 0x0C, 0x00],                   ; ret 12
+                    'addRef',         [0xB8, 0x01, 0, 0, 0, 0xC2, 0x04, 0x00],
+                    'release',        [0xB8, 0x01, 0, 0, 0, 0xC2, 0x04, 0x00],
+                    'getParameters',  [0xB8, 0x01, 0x40, 0x00, 0x80, 0xC2, 0x0C, 0x00]
+                )
+            }
+            static MEM_COMMIT_RESERVE := 0x3000, PAGE_READWRITE := 0x04, PAGE_EXECUTE_READ := 0x20
+            memory := DllCall('VirtualAlloc', 'Ptr', 0, 'Ptr', 128, 'UInt', MEM_COMMIT_RESERVE,
+                                              'UInt', PAGE_READWRITE, 'Ptr')
+            if !memory
+                throw OSError(A_LastError, -1, 'VirtualAlloc failed')
+            result := {}
+            offset := 0
+            for name, bytes in code {
+                result.%name% := memory + offset
+                for byteValue in bytes
+                    NumPut('UChar', byteValue, memory + offset++)
+                offset := (offset + 15) & ~15
+            }
+            DllCall('VirtualProtect', 'Ptr', memory, 'Ptr', 128, 'UInt', PAGE_EXECUTE_READ, 'UInt*', 0)
+            DllCall('FlushInstructionCache', 'Ptr', DllCall('GetCurrentProcess', 'Ptr'),
+                                             'Ptr', memory, 'Ptr', 128)
+            return stubs := result
+        }
+    }
+
     /**
-     * Frees the thunks and the closures they hold. Call only once the async
-     * operation is over: MF AddRefs the callback when the Begin call is made
-     * and Releases it after Invoke returns, and nothing touches it afterwards
-     * - measured in tests\AsyncCallbackTest.ahk (AddRef 1, Release 1, and no
-     * further calls while the source is built and used).
+     * Frees the Invoke thunk and the closure it holds. Call only once the
+     * async operation is over: MF AddRefs the callback when the Begin call is
+     * made and Releases it after Invoke returns, and nothing touches it
+     * afterwards - measured in tests\AsyncCallbackTest.ahk (AddRef 1,
+     * Release 1, and no further calls while the source is built and used).
+     * AddRef and Release are native stubs that are never freed.
      *
-     * Each thunk holds an AddRef'd reference to its closure, so without this
+     * The thunk holds an AddRef'd reference to its closure, so without this
      * the closure - and whatever it was bound to - lives until the process
      * ends.
      */
@@ -5389,6 +5567,18 @@ class AppIconSource
 
 class Icons
 {
+    ; A button does not own the icon it shows, and BM_SETIMAGE does not free
+    ; the previous one. Icons are therefore created once per name and size
+    ; and kept for the life of the process instead of a new HICON per change.
+    static Get(iconName, height := 0) {
+        static cache := Map()
+        cacheKey := iconName . '|' . height
+        if !cache.Has(cacheKey) || !cache[cacheKey] {
+            cache[cacheKey] := this.FromBase64(iconName, height)
+        }
+        return cache[cacheKey]
+    }
+
     static FromBase64(iconName, height := 0) {
         base64 := this._data[iconName]
         size := StrLen( RTrim(base64, '=') )*3//4
