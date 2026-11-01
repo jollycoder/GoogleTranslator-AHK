@@ -3707,10 +3707,9 @@ class CyclicDB
         try {
             scan := this._ScanHeaders(bakFile, previous.head, previous.tail,
                                       previous.wrapped, previous.maxSize)
-            ; A damaged header in the older lap only ends that lap (files
-            ; written before lap-end markers end it with leftover bytes); one in
-            ; the newer part would lose records.
-            if scan.badOffset && !scan.badInOldLap
+            ; A damaged header in the older lap only ends that lap; one in the
+            ; newer part would lose records.
+            if scan.badOffset
                 throw Error('corrupted record at offset ' . scan.badOffset)
 
             ; First pass: keys of the live records. A key written again later
@@ -3908,24 +3907,28 @@ class CyclicDB
             }
         }
 
-        if !scan.badOffset || this._readOnly
+        if this._readOnly
             return
-        ; Nothing after a damaged header can be walked. In the older lap that
-        ; spot becomes the lap end; in the newer part new records go there.
-        if scan.badInOldLap {
-            try this._WriteUShortAt(file, scan.badOffset, CyclicDB.RECORD_LAP_END)
-        } else {
+        ; The older lap ends at its damaged header, so it gets the marker there.
+        if scan.lapEndAt
+            try this._WriteUShortAt(file, scan.lapEndAt, CyclicDB.RECORD_LAP_END)
+        ; Nothing after a damaged header in the newer part can be walked: new
+        ; records go there.
+        if scan.badOffset {
             this.head := scan.badOffset
             try this._WriteGlobalHeader(file)
         }
     }
 
     ; Walks the record headers in logical order, oldest first, without reading
-    ; keys or data. Returns {records, badOffset, badInOldLap}: badOffset is 0
-    ; when the walk reached head, otherwise the offset of the damaged header
-    ; that stopped it.
+    ; keys or data. Returns {records, lapEndAt, badOffset}. A damaged header in
+    ; the older lap ends that lap - files written before lap-end markers end
+    ; it with leftover bytes - and the walk goes on with the newer lap;
+    ; lapEndAt is where that happened, or 0. A damaged header in the newer
+    ; part stops the walk; badOffset is where, or 0 when the walk reached head.
     _ScanHeaders(file, head, tail, wrapped, maxSize) {
         records    := []
+        lapEndAt   := 0
         pos        := tail
         inOldLap   := wrapped
         fileLength := file.Length
@@ -3942,18 +3945,26 @@ class CyclicDB
                     break
                 limit := Min(head, fileLength)
             }
-            if pos + CyclicDB.RECORD_HEADER_SIZE > limit
-                return {records: records, badOffset: pos, badInOldLap: inOldLap}
 
-            file.Seek(pos)
-            marker     := file.ReadUShort()
-            keyLength  := file.ReadUShort()
-            dataLength := file.ReadUInt()
-            crc        := file.ReadUInt()
-            recordSize := CyclicDB.RECORD_HEADER_SIZE + keyLength + dataLength
-            if (marker != CyclicDB.RECORD_MARKER && marker != CyclicDB.RECORD_DELETED)
-                || keyLength = 0 || pos + recordSize > limit
-                return {records: records, badOffset: pos, badInOldLap: inOldLap}
+            damaged := pos + CyclicDB.RECORD_HEADER_SIZE > limit
+            if !damaged {
+                file.Seek(pos)
+                marker     := file.ReadUShort()
+                keyLength  := file.ReadUShort()
+                dataLength := file.ReadUInt()
+                crc        := file.ReadUInt()
+                recordSize := CyclicDB.RECORD_HEADER_SIZE + keyLength + dataLength
+                damaged := (marker != CyclicDB.RECORD_MARKER && marker != CyclicDB.RECORD_DELETED)
+                           || keyLength = 0 || pos + recordSize > limit
+            }
+            if damaged {
+                if !inOldLap
+                    return {records: records, lapEndAt: lapEndAt, badOffset: pos}
+                lapEndAt := pos
+                pos      := CyclicDB.HEADER_SIZE
+                inOldLap := false
+                continue
+            }
 
             records.Push({
                 offset:     pos,
@@ -3965,7 +3976,7 @@ class CyclicDB
             })
             pos += recordSize
         }
-        return {records: records, badOffset: 0, badInOldLap: false}
+        return {records: records, lapEndAt: lapEndAt, badOffset: 0}
     }
 
     ; True when no record of the older lap starts at pos.
