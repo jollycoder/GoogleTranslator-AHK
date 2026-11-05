@@ -2,7 +2,7 @@
 #SingleInstance Force
 ;@Ahk2Exe-SetName GoogleTranslator
 ;@Ahk2Exe-SetDescription Google Translate client for Windows
-;@Ahk2Exe-SetVersion 1.0.0
+;@Ahk2Exe-SetVersion 1.0.1
 ;@Ahk2Exe-SetOrigFilename GoogleTranslator.exe
 ; The base path is relative to the compiler folder (AutoHotkey\Compiler).
 ;@Ahk2Exe-Base ..\v2\AutoHotkey64.exe
@@ -823,6 +823,9 @@ class GoogleTranslator
         if text == '' {
             return
         }
+        ; The window shows the text as entered; the request, the language
+        ; detection and the cache use it with soft line breaks joined.
+        requestText := LineUnwrapper.Join(text)
         ; The window may have been closed while a retry was pending.
         if wnd && !TranslateWindow.IsAlive(wnd) {
             return
@@ -832,7 +835,7 @@ class GoogleTranslator
             ; direction retry (mayRetryDirection=false) keeps that target.
             this.pasteTarget := this.GetFocusTarget()
         }
-        languageSelection := this.ResolveTranslationLanguages(text, tl, sl)
+        languageSelection := this.ResolveTranslationLanguages(requestText, tl, sl)
         sl := languageSelection.sourceLanguage
         tl := languageSelection.targetLanguage
         directionSide := languageSelection.directionSide
@@ -841,23 +844,23 @@ class GoogleTranslator
         cached := ''
         foundSl := sl
         if sl == 'auto' {
-            for cachedSourceLanguage in this.GetAutoCacheSourceCandidates(tl, directionSide, text) {
-                cached := this.cache.GetTranslation(text, cachedSourceLanguage, tl)
+            for cachedSourceLanguage in this.GetAutoCacheSourceCandidates(tl, directionSide, requestText) {
+                cached := this.cache.GetTranslation(requestText, cachedSourceLanguage, tl)
                 if cached != '' {
                     foundSl := cachedSourceLanguage
                     break
                 }
             }
         } else {
-            cached := this.cache.GetTranslation(text, sl, tl)
+            cached := this.cache.GetTranslation(requestText, sl, tl)
         }
         if cached != '' {
-            this.ShowTranslation(text, cached.trans, foundSl, tl, cached.variants, wnd)
+            this.ShowTranslation(text, cached.trans, foundSl, tl, cached.variants, wnd, requestText)
             return
         }
         
         (!this.noGui && !wnd && wnd := this.ShowTranslation(text, '', sl, tl))
-        chunks := this.SplitForTranslatePage(text)
+        chunks := this.SplitForTranslatePage(requestText)
         switch this.ChooseTranslator(chunks) {
             case 'TranslateDict':
                 try res := this.TranslateDict(chunks[1], tl)
@@ -885,7 +888,7 @@ class GoogleTranslator
                     translation .= res['trans']
                 }
         }
-        sl := this.CorrectDetectedSourceLanguage(res['sl'], directionSide, text)
+        sl := this.CorrectDetectedSourceLanguage(res['sl'], directionSide, requestText)
         if res.Has('oxfordAudio') && sl == res['sl'] && !this.cache.HasAudio(text, sl) {
             url := res['oxfordAudio']
             (!(url ~= 'i)^https?:') && url := 'https:' . url)
@@ -897,7 +900,8 @@ class GoogleTranslator
             SetTimer () => this.Translate(text, retryTargetLanguage, retrySourceLanguage, wnd, false), -100
             return
         }
-        this.ShowTranslation(text, translation, sl, tl, res.Has('variants') ? res['variants'] : '', wnd)
+        this.ShowTranslation(text, translation, sl, tl, res.Has('variants') ? res['variants'] : '',
+                             wnd, requestText)
     }
 
     static ResolveTranslationLanguages(text, tl := '', sl := 'auto') {
@@ -1388,9 +1392,12 @@ class GoogleTranslator
         return true
     }
 
-    static ShowTranslation(text, trans, sl, tl, variants := '', wnd := '') {
-        if trans !== '' && !this.cache.HasTranslation(text, sl, tl) {
-            this.cache.SetTranslation(text, sl, tl, trans, variants)
+    ; cacheText is the text the translation was requested for, if it differs
+    ; from the displayed one (see LineUnwrapper).
+    static ShowTranslation(text, trans, sl, tl, variants := '', wnd := '', cacheText := '') {
+        (cacheText == '' && cacheText := text)
+        if trans !== '' && !this.cache.HasTranslation(cacheText, sl, tl) {
+            this.cache.SetTranslation(cacheText, sl, tl, trans, variants)
         }
         if this.noGui && !wnd {
             A_Clipboard := trans
@@ -1894,7 +1901,11 @@ class TranslateWindow
             wnd := newGui is Gui ? newGui : this.lastGui
             wnd.lng1.Text := this.LangDisplayName('sl', sl)
             wnd.lng2.Text := this.LangDisplayName('tl', tl)
-            wnd.edit1.Text := sTxt
+            ; Writing the same text again would reset the caret and the undo
+            ; history of the text the user has just typed or pasted.
+            if Trim(wnd.edit1.Text, ' `t`r`n') !== sTxt {
+                wnd.edit1.Text := sTxt
+            }
             wnd.edit2.Text := tTxt
             wnd.play1.Enabled := true
             (tTxt != '' && wnd.play2.Enabled := true)
@@ -3011,6 +3022,57 @@ class HtmlCodec
             html := StrReplace(html, item[1], item[2])
         }
         return html
+    }
+}
+
+; Joins lines that a fixed-width layout (PDF, e-mail, books) broke in the
+; middle of a sentence. translateHtml receives every line break as <br> and
+; translates the parts on both sides of it as separate sentences.
+class LineUnwrapper
+{
+    static Join(text) {
+        lines := []
+        separators := []
+        searchPos := 1
+        while foundPos := RegExMatch(text, '\R', &lineBreak, searchPos) {
+            lines.Push(SubStr(text, searchPos, foundPos - searchPos))
+            separators.Push(lineBreak[0])
+            searchPos := foundPos + lineBreak.Len
+        }
+        if !separators.Length {
+            return text
+        }
+        lines.Push(SubStr(text, searchPos))
+
+        result := lines[1]
+        for index, separator in separators {
+            nextLine := lines[index + 1]
+            if this.IsSoftBreak(lines[index], nextLine) {
+                result := RTrim(result, ' `t')
+                ; A hyphen right after a letter keeps the parts together: it is
+                ; usually a compound word such as "state-of-the-art".
+                result .= (result ~= '\p{L}-$' ? '' : ' ') . nextLine
+            } else {
+                result .= separator . nextLine
+            }
+        }
+        return result
+    }
+
+    ; Conservative on purpose: a break is soft only when the line does not end
+    ; a sentence and the next one continues it with a lowercase letter. So a
+    ; heading without a period stays apart from a capitalized paragraph, and
+    ; scripts without letter case (CJK, Arabic, ...) are never joined.
+    static IsSoftBreak(previousLine, nextLine) {
+        previousLine := RTrim(previousLine, ' `t')
+        if previousLine == '' || nextLine == '' {
+            return false
+        }
+        if previousLine ~= '[.!?…:;]["`'”’»)\]]*$' {
+            return false
+        }
+        ; An indented line does not start with a letter; "a) " starts a list item.
+        return (nextLine ~= '^\p{Ll}') && !(nextLine ~= '^\p{Ll}[.)]\s')
     }
 }
 
@@ -5707,7 +5769,7 @@ class Icons
 class Config {
     ; Keep in sync with ;@Ahk2Exe-SetVersion at the top of the script:
     ; Tools\BuildRelease.ps1 refuses to build when they differ.
-    static VERSION := '1.0.0'
+    static VERSION := '1.0.1'
 
     static API_KEYS := {
         translatePage : 'AIzaSyATBXajvzQLTDHEQbcpq0Ihe0vWDHmO520',

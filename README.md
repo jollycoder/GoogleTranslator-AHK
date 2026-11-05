@@ -53,6 +53,7 @@ Double-clicking the icon runs `Open GUI`. The menu also provides commands for op
 - The program automatically chooses the direction within the saved language pair.
 - Additional meanings and translation variants may be shown for individual words.
 - Long text is automatically split into request-sized parts and assembled into a single translation.
+- Line breaks inside a sentence, as in text copied from PDF files or e-mail, are joined before translation, so the sentence is translated as a whole. The source text itself is shown unchanged.
 - Dark and light themes, multiple translator windows, and windowless operation are supported.
 
 ## Cache
