@@ -73,7 +73,7 @@ Speech playback uses Windows Media Foundation components. Windows N/KN editions 
 - An internet connection for initial setup, new translations, and speech
 - A writable script folder: settings, the language list, and the cache are stored there
 
-Text being translated or spoken is sent to Google services. The program uses Google Translate interfaces also used by browser extensions, so a personal API key is not required. Google may change these interfaces. This is an unofficial project and is not affiliated with or endorsed by Google.
+Text being translated or spoken is sent to Google services. The program uses the same Google Translate interfaces as Google's own browser-side clients (Google Translate website translation and the Google Dictionary extension), so a personal API key is not required. The API keys in the source code are the public keys built into those Google clients, not the author's personal keys: they are not linked to anyone's Google Cloud account, and nobody is billed for using the program. Google may change these interfaces. This is an unofficial project and is not affiliated with or endorsed by Google.
 
 ## Author and license
 

@@ -5771,6 +5771,9 @@ class Config {
     ; Tools\BuildRelease.ps1 refuses to build when they differ.
     static VERSION := '1.0.1'
 
+    ; Public keys built into Google's own browser-side clients (Google Translate
+    ; website translation and the Google Dictionary extension). They are not the
+    ; author's keys and are not tied to anyone's Google Cloud account or billing.
     static API_KEYS := {
         translatePage : 'AIzaSyATBXajvzQLTDHEQbcpq0Ihe0vWDHmO520',
         dictionary    : 'AIzaSyA6EEtrDCfBkHV8uU2lgGY-N383ZgAOo7Y'
