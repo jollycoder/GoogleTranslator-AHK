@@ -2,7 +2,7 @@
 
 A Google Translate client for Windows that lets you translate selected text in any application with a hotkey or work in a separate translator window. It supports speech for both the source text and the translation. No registration or personal API key is required.
 
-![Translator window](docs/images/translator-window.png)
+<img src="docs/images/translator-window.png" alt="Translator window" width="338">
 
 ## Quick start
 
