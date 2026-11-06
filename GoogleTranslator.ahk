@@ -827,8 +827,7 @@ class GoogleTranslator
         ; detection and the cache use it without a comment marker and with
         ; soft line breaks joined. The marker is put back on the translation.
         comment := CommentPrefix.Detect(text)
-        requestText := comment ? LineUnwrapper.Join(comment.body, true)
-                               : LineUnwrapper.Join(text)
+        requestText := comment ? comment.requestText : LineUnwrapper.Join(text)
         ; The window may have been closed while a retry was pending.
         if wnd && !TranslateWindow.IsAlive(wnd) {
             return
@@ -1402,6 +1401,7 @@ class GoogleTranslator
     static ShowTranslation(text, trans, sl, tl, variants := '', wnd := '', cacheText := '',
                            comment := '') {
         (cacheText == '' && cacheText := text)
+        trans := LineUnwrapper.AlignLines(cacheText, trans)
         if trans !== '' && !this.cache.HasTranslation(cacheText, sl, tl) {
             this.cache.SetTranslation(cacheText, sl, tl, trans, variants)
         }
@@ -3076,8 +3076,10 @@ class LineUnwrapper
 {
     ; Translate trims the text, and a selection usually starts at the first
     ; word, so the indent of the first line is unknown unless the caller says
-    ; otherwise (a comment body keeps it).
-    static Join(text, firstIndentKnown := false) {
+    ; otherwise (a comment body keeps it). mergedCounts receives, for each
+    ; line of the result, the number of source lines joined into it.
+    static Join(text, firstIndentKnown := false, &mergedCounts := '') {
+        mergedCounts := [1]
         lines := []
         separators := []
         searchPos := 1
@@ -3091,6 +3093,11 @@ class LineUnwrapper
         }
         lines.Push(SubStr(text, searchPos))
 
+        longestLine := 0
+        for textLine in lines {
+            longestLine := Max(longestLine, StrLen(Trim(textLine, ' `t')))
+        }
+
         result := lines[1]
         index := 1
         while index < lines.Length {
@@ -3100,15 +3107,25 @@ class LineUnwrapper
             while nextIndex < lines.Length && Trim(lines[nextIndex], ' `t') == '' {
                 nextIndex++
             }
-            if this.IsSoftBreak(lines[index], lines[nextIndex], firstIndentKnown || index > 1) {
+            joinLines := this.IsSoftBreak(lines[index], lines[nextIndex],
+                                          firstIndentKnown || index > 1,
+                                          index == 1 || this.EndsParagraph(lines[index - 1]))
+            ; Across blank lines the line must belong to the wrapped text: a
+            ; short line before them is a heading.
+            if joinLines && nextIndex > index + 1 {
+                joinLines := StrLen(Trim(lines[index], ' `t')) * 2 >= longestLine
+            }
+            if joinLines {
                 result := RTrim(result, ' `t')
                 ; A hyphen right after a letter keeps the parts together: it is
                 ; usually a compound word such as "state-of-the-art".
                 result .= (result ~= '\p{L}-$' ? '' : ' ') . LTrim(lines[nextIndex], ' `t')
+                mergedCounts[mergedCounts.Length] += 1
             } else {
                 Loop nextIndex - index {
                     lineIndex := index + A_Index - 1
                     result .= separators[lineIndex] . lines[lineIndex + 1]
+                    mergedCounts.Push(1)
                 }
             }
             index := nextIndex
@@ -3120,7 +3137,8 @@ class LineUnwrapper
     ; a sentence and the next one continues it with a lowercase letter. So a
     ; heading without a period stays apart from a capitalized paragraph, and
     ; scripts without letter case (CJK, Arabic, ...) are never joined.
-    static IsSoftBreak(previousLine, nextLine, previousIndentKnown := true) {
+    static IsSoftBreak(previousLine, nextLine, previousIndentKnown := true,
+                       previousStartsParagraph := false) {
         previousText := Trim(previousLine, ' `t')
         nextText := LTrim(nextLine, ' `t')
         if previousText == '' || nextText == '' {
@@ -3136,12 +3154,23 @@ class LineUnwrapper
         if !previousIndentKnown {
             return true
         }
-        ; Lines of one paragraph share an indent. A deeper one starts a nested
-        ; block (code, a quote), unless it lines up with the text of a list
-        ; item: that is how a long item wraps.
+        ; Lines of one paragraph share an indent, and a long list item wraps
+        ; to the column of its text. A deeper indent starts a nested block
+        ; (code, a quote), a smaller one ends it, unless the previous line
+        ; only had the first-line indent of a paragraph.
         nextIndent := this.IndentWidth(nextLine)
-        return nextIndent <= this.IndentWidth(previousLine)
-            || nextIndent == this.ListTextColumn(previousLine)
+        previousIndent := this.IndentWidth(previousLine)
+        if nextIndent == previousIndent || nextIndent == this.ListTextColumn(previousLine) {
+            return true
+        }
+        return nextIndent < previousIndent && previousStartsParagraph
+    }
+
+    ; A line after which an indented paragraph may start: a blank one or the
+    ; end of a sentence. After ":" an indented line is a block (code, a list).
+    static EndsParagraph(textLine) {
+        textLine := Trim(textLine, ' `t')
+        return textLine == '' || textLine ~= '[.!?…]["`'”’»)\]]*$'
     }
 
     static IndentWidth(textLine) {
@@ -3155,6 +3184,30 @@ class LineUnwrapper
             return -1
         }
         return StrLen(StrReplace(markerMatch[0], '`t', '    '))
+    }
+
+    ; translateHtml drops the leading spaces of a line and puts a space after
+    ; every <br>. Each line of a translation normally matches a line of the
+    ; request, so it gets that line's indent; otherwise only the extra space
+    ; is removed.
+    static AlignLines(requestText, translation) {
+        if !InStr(translation, '`n') {
+            return translation
+        }
+        requestLines := StrSplit(requestText, '`n', '`r')
+        translatedLines := StrSplit(translation, '`n', '`r')
+        sameShape := requestLines.Length == translatedLines.Length
+        result := ''
+        for index, translatedLine in translatedLines {
+            if sameShape {
+                RegExMatch(requestLines[index], '^[ \t]*', &indentMatch)
+                translatedLine := indentMatch[0] . LTrim(translatedLine, ' `t')
+            } else if index > 1 {
+                translatedLine := RegExReplace(translatedLine, '^ ')
+            }
+            result .= (index > 1 ? '`r`n' : '') . translatedLine
+        }
+        return result
     }
 }
 
@@ -3171,8 +3224,8 @@ class CommentPrefix
         marker := ''
         body := ''
         contentWidth := 0
-        for line in lines {
-            if !RegExMatch(line, markerPattern, &markerMatch) {
+        for textLine in lines {
+            if !RegExMatch(textLine, markerPattern, &markerMatch) {
                 return ''
             }
             if A_Index == 1 {
@@ -3182,15 +3235,13 @@ class CommentPrefix
                 return ''
             }
             restIndent := markerMatch[1]
-            body .= (A_Index > 1 ? '`n' : '') . RTrim(SubStr(line, markerMatch.Len + 1), ' `t')
-            contentWidth := Max(contentWidth, StrLen(RTrim(line, ' `t')) - markerMatch.Len[1])
+            body .= (A_Index > 1 ? '`n' : '') . RTrim(SubStr(textLine, markerMatch.Len + 1), ' `t')
+            contentWidth := Max(contentWidth, StrLen(RTrim(textLine, ' `t')) - markerMatch.Len[1])
         }
         if Trim(body, ' `t`n') == '' {
             return ''
         }
-        ; A one-line comment stays on one line; a wrapped one is wrapped again.
-        return CommentPrefix(marker, firstIndent, restIndent, body,
-                             lines.Length > 1 ? contentWidth : 0)
+        return CommentPrefix(marker, firstIndent, restIndent, body, contentWidth)
     }
 
     ; The first line keeps its own indent: Translate trims it, and a selection
@@ -3201,26 +3252,40 @@ class CommentPrefix
         this.restIndent := restIndent
         this.body := body
         this.wrapWidth := wrapWidth
+        this.requestText := LineUnwrapper.Join(body, true, &mergedCounts)
+        this.mergedCounts := mergedCounts
     }
 
+    ; translation is aligned with requestText (see LineUnwrapper.AlignLines).
+    ; Only a line joined from several source lines is wrapped to the width of
+    ; the comment: a line that was alone in the source stays alone.
     Restore(translation) {
         if translation == '' {
             return ''
         }
         prefix := this.marker . ' '
-        ; Russian or German text is longer than English: a too narrow column
-        ; would leave a word or two on a line.
-        lineWidth := Max(20, this.wrapWidth - StrLen(prefix))
+        translatedLines := StrSplit(translation, '`n', '`r')
+        sameShape := translatedLines.Length == this.mergedCounts.Length
+        anyMerged := false
+        for mergedCount in this.mergedCounts {
+            anyMerged := anyMerged || mergedCount > 1
+        }
         result := ''
         isFirstLine := true
-        for translatedLine in StrSplit(translation, '`n', '`r') {
-            translatedLine := Trim(translatedLine, ' `t')
-            parts := this.wrapWidth && translatedLine != ''
-                ? CommentPrefix.Wrap(translatedLine, lineWidth)
-                : [translatedLine]
+        for index, translatedLine in translatedLines {
+            RegExMatch(translatedLine, '^[ \t]*', &indentMatch)
+            innerIndent := indentMatch[0]
+            lineText := Trim(translatedLine, ' `t')
+            wrapLine := sameShape ? this.mergedCounts[index] > 1 : anyMerged
+            ; Russian or German text is longer than English: a too narrow
+            ; column would leave a word or two on a line.
+            lineWidth := Max(20, this.wrapWidth - StrLen(prefix . innerIndent))
+            parts := wrapLine && lineText != ''
+                ? CommentPrefix.Wrap(lineText, lineWidth)
+                : [lineText]
             for part in parts {
                 result .= (isFirstLine ? this.firstIndent : '`r`n' . this.restIndent)
-                        . (part == '' ? this.marker : prefix . part)
+                        . (part == '' ? this.marker : prefix . innerIndent . part)
                 isFirstLine := false
             }
         }
