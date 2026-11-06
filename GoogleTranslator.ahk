@@ -2,7 +2,7 @@
 #SingleInstance Force
 ;@Ahk2Exe-SetName GoogleTranslator
 ;@Ahk2Exe-SetDescription Google Translate client for Windows
-;@Ahk2Exe-SetVersion 1.0.1
+;@Ahk2Exe-SetVersion 1.0.2
 ;@Ahk2Exe-SetOrigFilename GoogleTranslator.exe
 ; The base path is relative to the compiler folder (AutoHotkey\Compiler).
 ;@Ahk2Exe-Base ..\v2\AutoHotkey64.exe
@@ -824,8 +824,11 @@ class GoogleTranslator
             return
         }
         ; The window shows the text as entered; the request, the language
-        ; detection and the cache use it with soft line breaks joined.
-        requestText := LineUnwrapper.Join(text)
+        ; detection and the cache use it without a comment marker and with
+        ; soft line breaks joined. The marker is put back on the translation.
+        comment := CommentPrefix.Detect(text)
+        requestText := comment ? LineUnwrapper.Join(comment.body, true)
+                               : LineUnwrapper.Join(text)
         ; The window may have been closed while a retry was pending.
         if wnd && !TranslateWindow.IsAlive(wnd) {
             return
@@ -855,7 +858,8 @@ class GoogleTranslator
             cached := this.cache.GetTranslation(requestText, sl, tl)
         }
         if cached != '' {
-            this.ShowTranslation(text, cached.trans, foundSl, tl, cached.variants, wnd, requestText)
+            this.ShowTranslation(text, cached.trans, foundSl, tl, cached.variants, wnd,
+                                 requestText, comment)
             return
         }
         
@@ -901,7 +905,7 @@ class GoogleTranslator
             return
         }
         this.ShowTranslation(text, translation, sl, tl, res.Has('variants') ? res['variants'] : '',
-                             wnd, requestText)
+                             wnd, requestText, comment)
     }
 
     static ResolveTranslationLanguages(text, tl := '', sl := 'auto') {
@@ -1393,12 +1397,15 @@ class GoogleTranslator
     }
 
     ; cacheText is the text the translation was requested for, if it differs
-    ; from the displayed one (see LineUnwrapper).
-    static ShowTranslation(text, trans, sl, tl, variants := '', wnd := '', cacheText := '') {
+    ; from the displayed one (see LineUnwrapper). The cache keeps the
+    ; translation without the comment marker, so it is put back here.
+    static ShowTranslation(text, trans, sl, tl, variants := '', wnd := '', cacheText := '',
+                           comment := '') {
         (cacheText == '' && cacheText := text)
         if trans !== '' && !this.cache.HasTranslation(cacheText, sl, tl) {
             this.cache.SetTranslation(cacheText, sl, tl, trans, variants)
         }
+        (comment && trans := comment.Restore(trans))
         if this.noGui && !wnd {
             A_Clipboard := trans
             if this.PasteTargetChanged() {
@@ -1864,7 +1871,7 @@ class GoogleTranslator
 class TranslateWindow
 {
     static guis := LinkedOrderedMap(), lastGui := ''
-         , resizeParams := {wnd: '', height: ''}
+         , resizeParams := {wnd: ''}
          , adjustLayoutTimer := ObjBindMethod(this, 'AdjustLayout', this.resizeParams)
          , restoreTextTimers := Map(), restoreTextExpected := Map()
 
@@ -2071,10 +2078,41 @@ class TranslateWindow
         if this.guis.Has(hwnd) {
             wnd := this.guis[hwnd]
             switch event {
-                case EVENT_SYSTEM_MOVESIZESTART : this.StoreVerticalCoords(wnd)
-                case EVENT_SYSTEM_MOVESIZEEND   : this.DeleteProp('changeResizeMode')
+                case EVENT_SYSTEM_MOVESIZESTART:
+                    ; The previous drag may still be laid out halfway (a Size
+                    ; thread or the correction timer is pending), so finish it
+                    ; before the positions are taken as the base of this drag.
+                    this.LayoutToClientSize(wnd)
+                    this.DeleteProp('changeResizeMode')
+                    this.StoreVerticalCoords(wnd)
+                case EVENT_SYSTEM_MOVESIZEEND:
+                    ; Size events of a drag may be lost (see OnGuiSize), the
+                    ; last one included, so lay out by the final size.
+                    SetTimer(ObjBindMethod(this, 'FinishResize', wnd), -1)
             }
         }
+    }
+
+    static FinishResize(wnd) {
+        if this.IsAlive(wnd) {
+            this.LayoutToClientSize(wnd)
+        }
+        this.DeleteProp('changeResizeMode')
+    }
+
+    ; Lays the controls out for the current client size, whatever size the
+    ; Size events reported.
+    static LayoutToClientSize(wnd) {
+        if !wnd.HasOwnProp('edge') || !wnd.HasOwnProp('coords')
+                || WinGetMinMax(wnd.Hwnd) == -1 {
+            return
+        }
+        SetWinDelay 0
+        SetControlDelay 0
+        wnd.GetClientPos(,, &width, &height)
+        this.ResizeHorizontal(wnd, width)
+        this.ResizeVertical(wnd, height)
+        this.AdjustLayout({wnd: wnd})
     }
 
     static WM_KEYDOWN(wp, lp, msg, hwnd) {
@@ -2249,7 +2287,7 @@ class TranslateWindow
         this.StoreVerticalCoords(wnd)
         wnd.Show('h' . newHeight)
 
-        this.ShedulePosCorrection(wnd, newHeight)
+        this.ShedulePosCorrection(wnd)
     }
 
     static WaitForTranslation(wnd) {
@@ -2549,15 +2587,21 @@ class TranslateWindow
         }
     }
 
-    static OnGuiSize(wnd, minMax, width, height) {
+    ; AutoHotkey drops a Size event that arrives while the previous one is
+    ; still handled or while the script cannot be interrupted (for example a
+    ; timer thread in its first 15 ms), so the size in an event may be
+    ; outdated and the last event may never come: the layout follows the
+    ; current client size, and FinishResize repeats it when a drag ends.
+    static OnGuiSize(wnd, minMax, *) {
         if !wnd.HasOwnProp('edge') || !wnd.HasOwnProp('coords') || minMax == -1 {
             return
         }
         SetWinDelay 0
         SetControlDelay 0
+        wnd.GetClientPos(,, &width, &height)
         this.ResizeHorizontal(wnd, width)
         this.ResizeVertical(wnd, height)
-        this.ShedulePosCorrection(wnd, height)
+        this.ShedulePosCorrection(wnd)
     }
 
     static ResizeHorizontal(wnd, width) {
@@ -2625,18 +2669,18 @@ class TranslateWindow
         }
     }
 
-    static ShedulePosCorrection(wnd, height) {
+    static ShedulePosCorrection(wnd) {
         this.resizeParams.wnd := wnd
-        this.resizeParams.height := height
         SetTimer this.adjustLayoutTimer, -50
     }
 
     static AdjustLayout(params) {
         try {
+            params.wnd.GetClientPos(,,, &height)
             params.wnd.edit2.GetPos(, &y)
-            params.wnd.edit2.Move(,,, params.height - y - 37)
+            params.wnd.edit2.Move(,,, height - y - 37)
             for ctrl in ['play2', 'stop2', 'trans2'] {
-                params.wnd.%ctrl%.Move(, params.height - 32)
+                params.wnd.%ctrl%.Move(, height - 32)
             }
         }
     }
@@ -3030,7 +3074,10 @@ class HtmlCodec
 ; translates the parts on both sides of it as separate sentences.
 class LineUnwrapper
 {
-    static Join(text) {
+    ; Translate trims the text, and a selection usually starts at the first
+    ; word, so the indent of the first line is unknown unless the caller says
+    ; otherwise (a comment body keeps it).
+    static Join(text, firstIndentKnown := false) {
         lines := []
         separators := []
         searchPos := 1
@@ -3045,16 +3092,26 @@ class LineUnwrapper
         lines.Push(SubStr(text, searchPos))
 
         result := lines[1]
-        for index, separator in separators {
-            nextLine := lines[index + 1]
-            if this.IsSoftBreak(lines[index], nextLine) {
+        index := 1
+        while index < lines.Length {
+            ; Blank lines in the middle of a sentence are left by some PDF
+            ; viewers, so the decision is made with the next non-blank line.
+            nextIndex := index + 1
+            while nextIndex < lines.Length && Trim(lines[nextIndex], ' `t') == '' {
+                nextIndex++
+            }
+            if this.IsSoftBreak(lines[index], lines[nextIndex], firstIndentKnown || index > 1) {
                 result := RTrim(result, ' `t')
                 ; A hyphen right after a letter keeps the parts together: it is
                 ; usually a compound word such as "state-of-the-art".
-                result .= (result ~= '\p{L}-$' ? '' : ' ') . nextLine
+                result .= (result ~= '\p{L}-$' ? '' : ' ') . LTrim(lines[nextIndex], ' `t')
             } else {
-                result .= separator . nextLine
+                Loop nextIndex - index {
+                    lineIndex := index + A_Index - 1
+                    result .= separators[lineIndex] . lines[lineIndex + 1]
+                }
             }
+            index := nextIndex
         }
         return result
     }
@@ -3063,16 +3120,130 @@ class LineUnwrapper
     ; a sentence and the next one continues it with a lowercase letter. So a
     ; heading without a period stays apart from a capitalized paragraph, and
     ; scripts without letter case (CJK, Arabic, ...) are never joined.
-    static IsSoftBreak(previousLine, nextLine) {
-        previousLine := RTrim(previousLine, ' `t')
-        if previousLine == '' || nextLine == '' {
+    static IsSoftBreak(previousLine, nextLine, previousIndentKnown := true) {
+        previousText := Trim(previousLine, ' `t')
+        nextText := LTrim(nextLine, ' `t')
+        if previousText == '' || nextText == '' {
             return false
         }
-        if previousLine ~= '[.!?…:;]["`'”’»)\]]*$' {
+        if previousText ~= '[.!?…:;]["`'”’»)\]]*$' {
             return false
         }
-        ; An indented line does not start with a letter; "a) " starts a list item.
-        return (nextLine ~= '^\p{Ll}') && !(nextLine ~= '^\p{Ll}[.)]\s')
+        ; "a) " starts a list item.
+        if !(nextText ~= '^\p{Ll}') || nextText ~= '^\p{Ll}[.)]\s' {
+            return false
+        }
+        if !previousIndentKnown {
+            return true
+        }
+        ; Lines of one paragraph share an indent. A deeper one starts a nested
+        ; block (code, a quote), unless it lines up with the text of a list
+        ; item: that is how a long item wraps.
+        nextIndent := this.IndentWidth(nextLine)
+        return nextIndent <= this.IndentWidth(previousLine)
+            || nextIndent == this.ListTextColumn(previousLine)
+    }
+
+    static IndentWidth(textLine) {
+        RegExMatch(textLine, '^[ \t]*', &indentMatch)
+        return StrLen(StrReplace(indentMatch[0], '`t', '    '))
+    }
+
+    ; The column where the text of a list item starts, or -1.
+    static ListTextColumn(textLine) {
+        if !RegExMatch(textLine, '^[ \t]*(?:[-*+•]|\d+[.)]|\p{Ll}[.)])[ \t]+', &markerMatch) {
+            return -1
+        }
+        return StrLen(StrReplace(markerMatch[0], '`t', '    '))
+    }
+}
+
+; Text whose every line starts with the same comment or quote marker: a code
+; comment or an e-mail quote. Translated as is, the marker breaks a sentence at
+; each line and may get lost, so it is taken off for the request and put back
+; on the translation. List markers (-, *, numbers) are not taken: joining list
+; items would merge them into one phrase.
+class CommentPrefix
+{
+    static Detect(text) {
+        static markerPattern := '^([ \t]*)(//+|;+|#+|-{2,}|%+|>+)(?: |$)'
+        lines := StrSplit(text, '`n', '`r')
+        marker := ''
+        body := ''
+        contentWidth := 0
+        for line in lines {
+            if !RegExMatch(line, markerPattern, &markerMatch) {
+                return ''
+            }
+            if A_Index == 1 {
+                marker := markerMatch[2]
+                firstIndent := markerMatch[1]
+            } else if markerMatch[2] !== marker {
+                return ''
+            }
+            restIndent := markerMatch[1]
+            body .= (A_Index > 1 ? '`n' : '') . RTrim(SubStr(line, markerMatch.Len + 1), ' `t')
+            contentWidth := Max(contentWidth, StrLen(RTrim(line, ' `t')) - markerMatch.Len[1])
+        }
+        if Trim(body, ' `t`n') == '' {
+            return ''
+        }
+        ; A one-line comment stays on one line; a wrapped one is wrapped again.
+        return CommentPrefix(marker, firstIndent, restIndent, body,
+                             lines.Length > 1 ? contentWidth : 0)
+    }
+
+    ; The first line keeps its own indent: Translate trims it, and a selection
+    ; usually starts at the marker. The other lines get the indent of the block.
+    __New(marker, firstIndent, restIndent, body, wrapWidth) {
+        this.marker := marker
+        this.firstIndent := firstIndent
+        this.restIndent := restIndent
+        this.body := body
+        this.wrapWidth := wrapWidth
+    }
+
+    Restore(translation) {
+        if translation == '' {
+            return ''
+        }
+        prefix := this.marker . ' '
+        ; Russian or German text is longer than English: a too narrow column
+        ; would leave a word or two on a line.
+        lineWidth := Max(20, this.wrapWidth - StrLen(prefix))
+        result := ''
+        isFirstLine := true
+        for translatedLine in StrSplit(translation, '`n', '`r') {
+            translatedLine := Trim(translatedLine, ' `t')
+            parts := this.wrapWidth && translatedLine != ''
+                ? CommentPrefix.Wrap(translatedLine, lineWidth)
+                : [translatedLine]
+            for part in parts {
+                result .= (isFirstLine ? this.firstIndent : '`r`n' . this.restIndent)
+                        . (part == '' ? this.marker : prefix . part)
+                isFirstLine := false
+            }
+        }
+        return result
+    }
+
+    ; Greedy word wrap; a word longer than the line takes a line of its own.
+    static Wrap(textLine, lineWidth) {
+        parts := []
+        current := ''
+        for word in StrSplit(textLine, ' ') {
+            if word == '' {
+                continue
+            }
+            if current != '' && StrLen(current) + 1 + StrLen(word) > lineWidth {
+                parts.Push(current)
+                current := word
+            } else {
+                current .= (current == '' ? '' : ' ') . word
+            }
+        }
+        parts.Push(current)
+        return parts
     }
 }
 
@@ -5769,7 +5940,7 @@ class Icons
 class Config {
     ; Keep in sync with ;@Ahk2Exe-SetVersion at the top of the script:
     ; Tools\BuildRelease.ps1 refuses to build when they differ.
-    static VERSION := '1.0.1'
+    static VERSION := '1.0.2'
 
     ; Public keys built into Google's own browser-side clients (Google Translate
     ; website translation and the Google Dictionary extension). They are not the
