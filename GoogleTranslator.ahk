@@ -2,7 +2,7 @@
 #SingleInstance Force
 ;@Ahk2Exe-SetName GoogleTranslator
 ;@Ahk2Exe-SetDescription Google Translate client for Windows
-;@Ahk2Exe-SetVersion 1.0.2
+;@Ahk2Exe-SetVersion 1.0.3
 ;@Ahk2Exe-SetOrigFilename GoogleTranslator.exe
 ; The base path is relative to the compiler folder (AutoHotkey\Compiler).
 ;@Ahk2Exe-Base ..\v2\AutoHotkey64.exe
@@ -2083,7 +2083,6 @@ class TranslateWindow
                     ; thread or the correction timer is pending), so finish it
                     ; before the positions are taken as the base of this drag.
                     this.LayoutToClientSize(wnd)
-                    this.DeleteProp('changeResizeMode')
                     this.StoreVerticalCoords(wnd)
                 case EVENT_SYSTEM_MOVESIZEEND:
                     ; Size events of a drag may be lost (see OnGuiSize), the
@@ -2097,7 +2096,6 @@ class TranslateWindow
         if this.IsAlive(wnd) {
             this.LayoutToClientSize(wnd)
         }
-        this.DeleteProp('changeResizeMode')
     }
 
     ; Lays the controls out for the current client size, whatever size the
@@ -2618,55 +2616,62 @@ class TranslateWindow
         }
     }
 
+    ; The layout of a drag is computed only from the positions stored when it
+    ; started (StoreVerticalCoords) and the current height. So a lost Size
+    ; event, or a single jump when Windows shows only an outline while
+    ; resizing, ends in the same layout as a smooth drag. The field at the
+    ; dragged edge takes the change first; when it reaches its minimum, the
+    ; other field takes the rest.
     static ResizeVertical(wnd, height) {
+        static MIN_EDIT_HEIGHT := 60
+        coords := wnd.coords
+        if !coords.Has('height') {
+            return
+        }
+        delta := height - coords['height']
+        edit1H := coords['edit1'].h
+        edit2H := coords['edit2'].h
         if wnd.edge ~= 'i)top' {
-            topEditHeight := height - wnd.coords['height'] + wnd.coords['edit1'].h
-            if topEditHeight > 60 {
-                ResizeTop()
-            } else {
-                if !this.HasOwnProp('changeResizeMode') {
-                    this.changeResizeMode := true
-                    this.StoreVerticalCoords(wnd)
-                }
-                bottomEditHeight := height - wnd.coords['height'] + wnd.coords['edit2'].h
-                if bottomEditHeight > 60 {
-                    ResizeBottom()
-                }
+            edit1H += delta
+            if edit1H < MIN_EDIT_HEIGHT {
+                edit2H += edit1H - MIN_EDIT_HEIGHT
+                edit1H := MIN_EDIT_HEIGHT
+            }
+        } else {
+            edit2H += delta
+            if edit2H < MIN_EDIT_HEIGHT {
+                edit1H += edit2H - MIN_EDIT_HEIGHT
+                edit2H := MIN_EDIT_HEIGHT
             }
         }
-        if wnd.edge ~= 'i)bottom' {
-            bottomEditHeight := height - wnd.coords['height'] + wnd.coords['edit2'].h
-            if bottomEditHeight > 60 {
-                ResizeBottom()
-            } else {
-                if !this.HasOwnProp('changeResizeMode') {
-                    this.changeResizeMode := true
-                    this.StoreVerticalCoords(wnd)
-                }
-                topEditHeight := height - wnd.coords['height'] + wnd.coords['edit1'].h
-                if topEditHeight > 60 {
-                    ResizeTop()
-                }
-            }
-        }
+        edit1H := Max(edit1H, MIN_EDIT_HEIGHT)
+        edit2H := Max(edit2H, MIN_EDIT_HEIGHT)
+        middleShift := edit1H - coords['edit1'].h
+        bottomShift := middleShift + edit2H - coords['edit2'].h
 
-        ResizeTop() {
-            wnd.edit1.Move(,,, topEditHeight)
-            wnd.edit1.Redraw()
-            for ctrl in ['txt2', 'lng2', 'swapLang2', 'edit2', 'play1', 'stop1', 'trans1', 'play2', 'stop2', 'trans2'] {
-                wnd.%ctrl%.Move(, height - wnd.coords['height'] + wnd.coords[ctrl].y)
-                wnd.%ctrl%.Redraw()
-            }
+        this.PlaceControl(wnd.edit1, coords['edit1'].y, edit1H)
+        for ctrl in ['txt2', 'lng2', 'swapLang2', 'play1', 'stop1', 'trans1'] {
+            this.PlaceControl(wnd.%ctrl%, coords[ctrl].y + middleShift)
         }
+        this.PlaceControl(wnd.edit2, coords['edit2'].y + middleShift, edit2H)
+        for ctrl in ['play2', 'stop2', 'trans2'] {
+            this.PlaceControl(wnd.%ctrl%, coords[ctrl].y + bottomShift)
+        }
+    }
 
-        ResizeBottom() {
-            wnd.edit2.Move(,,, bottomEditHeight)
-            wnd.edit2.Redraw()
-            for ctrl in ['play2', 'stop2', 'trans2'] {
-                wnd.%ctrl%.Move(, height - wnd.coords['height'] + wnd.coords[ctrl].y)
-                wnd.%ctrl%.Redraw()
-            }
+    ; Moves and redraws a control only when its place changes: redrawing
+    ; every control on each layout pass makes the window flicker.
+    static PlaceControl(ctrl, y, h := '') {
+        ctrl.GetPos(, &currentY,, &currentH)
+        if currentY == y && (h == '' || currentH == h) {
+            return
         }
+        if h == '' {
+            ctrl.Move(, y)
+        } else {
+            ctrl.Move(, y,, h)
+        }
+        ctrl.Redraw()
     }
 
     static ShedulePosCorrection(wnd) {
@@ -6005,7 +6010,7 @@ class Icons
 class Config {
     ; Keep in sync with ;@Ahk2Exe-SetVersion at the top of the script:
     ; Tools\BuildRelease.ps1 refuses to build when they differ.
-    static VERSION := '1.0.2'
+    static VERSION := '1.0.3'
 
     ; Public keys built into Google's own browser-side clients (Google Translate
     ; website translation and the Google Dictionary extension). They are not the
