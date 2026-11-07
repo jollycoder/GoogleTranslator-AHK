@@ -2,7 +2,7 @@
 #SingleInstance Force
 ;@Ahk2Exe-SetName GoogleTranslator
 ;@Ahk2Exe-SetDescription Google Translate client for Windows
-;@Ahk2Exe-SetVersion 1.1.0
+;@Ahk2Exe-SetVersion 1.1.1
 ;@Ahk2Exe-SetOrigFilename GoogleTranslator.exe
 ; The base path is relative to the compiler folder (AutoHotkey\Compiler).
 ;@Ahk2Exe-Base ..\v2\AutoHotkey64.exe
@@ -1953,7 +1953,11 @@ class TranslateWindow
             ; Writing the same text again would reset the caret and the undo
             ; history of the text the user has just typed or pasted.
             if Trim(wnd.edit1.Text, ' `t`r`n') !== sTxt {
+                this.StopFieldPlayback(wnd, 1)
                 wnd.edit1.Text := sTxt
+            }
+            if wnd.edit2.Text !== tTxt {
+                this.StopFieldPlayback(wnd, 2)
             }
             wnd.edit2.Text := tTxt
             wnd.play1.Enabled := true
@@ -1961,8 +1965,31 @@ class TranslateWindow
         }
         this.lastSl := sl
         SetTimer wnd.waitTimer, tTxt == '' ? 300 : 0
-        (tTxt != '' && !GoogleTranslator.rememberSize && this.AdjustGuiSize(wnd, tTxt))
+        if tTxt != '' {
+            if GoogleTranslator.rememberSize {
+                ; AdjustGuiSize is what shows the window otherwise: without it
+                ; a minimized window would stay minimized.
+                if WinGetMinMax(wnd.Hwnd) == -1 {
+                    WinRestore(wnd.Hwnd)
+                }
+                wnd.Show()
+            } else {
+                this.AdjustGuiSize(wnd, tTxt)
+            }
+        }
         return wnd
+    }
+
+    ; A new text in a field ends the speech of the old one: a paused channel
+    ; would otherwise resume the old text on the next press of Play.
+    static StopFieldPlayback(wnd, i) {
+        id := wnd.play%i%.hwnd
+        if !AudioChannel.channels.Has(id) {
+            return
+        }
+        AudioChannel.RemoveChannel(id)
+        this.SetButtonIcon(wnd.play%i%, 'play', 12)
+        wnd.stop%i%.Enabled := false
     }
 
     static TranslationFailed(wnd) {
@@ -6403,7 +6430,7 @@ class Icons
 class Config {
     ; Keep in sync with ;@Ahk2Exe-SetVersion at the top of the script:
     ; Tools\BuildRelease.ps1 refuses to build when they differ.
-    static VERSION := '1.1.0'
+    static VERSION := '1.1.1'
 
     ; Public keys built into Google's own browser-side clients (Google Translate
     ; website translation and the Google Dictionary extension). They are not the
