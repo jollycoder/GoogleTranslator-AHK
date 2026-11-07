@@ -31,7 +31,7 @@ In the top field, you can type or paste the source text, select the source and t
 
 The reverse translation button translates text from the bottom field in the opposite direction. Pressing `Enter` in the bottom field does the same. The buttons next to the language lists swap the source and target languages. Pointing to a button shows a tooltip in your native language.
 
-You can resize the window with the mouse: dragging the top edge enlarges the top text field, while dragging the bottom edge enlarges the bottom field. To change the ratio of the fields without changing the window height, drag the bottom edge of the top field or the top edge of the bottom one. After a translation, the bottom field grows to fit it, unless `Remember Window Size` is turned on in the tray menu. To change the font size of an individual field, point to it, hold `Ctrl`, and scroll the mouse wheel.
+You can resize the window with the mouse: dragging the top edge enlarges the top text field, while dragging the bottom edge enlarges the bottom field. When the window is taller than its minimum height, that is, when at least one field has been enlarged, you can also change the ratio of the fields without changing the window height: drag the bottom edge of the top field or the top edge of the bottom one. After a translation, the bottom field grows to fit it, unless `Remember Window Size` is turned on in the tray menu. To change the font size of an individual field, point to it, hold `Ctrl`, and scroll the mouse wheel.
 
 ## Tray menu
 
