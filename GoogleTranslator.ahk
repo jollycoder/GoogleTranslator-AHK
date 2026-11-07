@@ -2,7 +2,7 @@
 #SingleInstance Force
 ;@Ahk2Exe-SetName GoogleTranslator
 ;@Ahk2Exe-SetDescription Google Translate client for Windows
-;@Ahk2Exe-SetVersion 1.0.3
+;@Ahk2Exe-SetVersion 1.0.4
 ;@Ahk2Exe-SetOrigFilename GoogleTranslator.exe
 ; The base path is relative to the compiler folder (AutoHotkey\Compiler).
 ;@Ahk2Exe-Base ..\v2\AutoHotkey64.exe
@@ -1871,6 +1871,7 @@ class GoogleTranslator
 class TranslateWindow
 {
     static guis := LinkedOrderedMap(), lastGui := ''
+         , MIN_EDIT_HEIGHT := 60, MAX_AUTO_EDIT_HEIGHT := 350
          , resizeParams := {wnd: ''}
          , adjustLayoutTimer := ObjBindMethod(this, 'AdjustLayout', this.resizeParams)
          , restoreTextTimers := Map(), restoreTextExpected := Map()
@@ -1980,7 +1981,15 @@ class TranslateWindow
             OnMessage(0x20A, this.onMouseWheel := ObjBindMethod(this, 'WM_MOUSEWHEEL'))
             OnMessage(0x100, this.onKeyDown    := ObjBindMethod(this, 'WM_KEYDOWN'))
         }
+        ; A window opened with a ready translation (from the cache) already
+        ; has a tall bottom field. The minimum size is that of the window
+        ; with both fields at their minimum height, or the window could never
+        ; be made lower than it was opened.
         wnd.GetClientPos(,, &guiW, &guiH)
+        Loop 2 {
+            wnd.edit%A_Index%.GetPos(,,, &editH)
+            guiH -= Max(0, editH - this.MIN_EDIT_HEIGHT)
+        }
         wnd.Opt('+MinSize' . guiW . 'x' . guiH)
         return wnd
     }
@@ -2274,11 +2283,16 @@ class TranslateWindow
     }
 
     static AdjustGuiSize(wnd, txt) {
+        ; The client area of a minimized window is empty, and a height counted
+        ; from it is cut to the minimum size. Show below restores the window
+        ; anyway, so restore it first and count from its real height.
+        if WinGetMinMax(wnd.Hwnd) == -1 {
+            WinRestore(wnd.Hwnd)
+        }
         wnd.edit2.GetPos(,, &editW, &editH)
         wnd.GetClientPos(,, &guiW, &guiH)
         newEditH := this.GetTextHeight(this.fontSize[2], 'Calibri', editW, txt) + 15
-        (newEditH < 60 && newEditH := 60)
-        (newEditH > 350 && newEditH := 350)
+        newEditH := Max(this.MIN_EDIT_HEIGHT, Min(newEditH, this.MAX_AUTO_EDIT_HEIGHT))
         newHeight := guiH + newEditH - editH
 
         wnd.edge := 'bottom'
@@ -2623,7 +2637,6 @@ class TranslateWindow
     ; dragged edge takes the change first; when it reaches its minimum, the
     ; other field takes the rest.
     static ResizeVertical(wnd, height) {
-        static MIN_EDIT_HEIGHT := 60
         coords := wnd.coords
         if !coords.Has('height') {
             return
@@ -2633,19 +2646,19 @@ class TranslateWindow
         edit2H := coords['edit2'].h
         if wnd.edge ~= 'i)top' {
             edit1H += delta
-            if edit1H < MIN_EDIT_HEIGHT {
-                edit2H += edit1H - MIN_EDIT_HEIGHT
-                edit1H := MIN_EDIT_HEIGHT
+            if edit1H < this.MIN_EDIT_HEIGHT {
+                edit2H += edit1H - this.MIN_EDIT_HEIGHT
+                edit1H := this.MIN_EDIT_HEIGHT
             }
         } else {
             edit2H += delta
-            if edit2H < MIN_EDIT_HEIGHT {
-                edit1H += edit2H - MIN_EDIT_HEIGHT
-                edit2H := MIN_EDIT_HEIGHT
+            if edit2H < this.MIN_EDIT_HEIGHT {
+                edit1H += edit2H - this.MIN_EDIT_HEIGHT
+                edit2H := this.MIN_EDIT_HEIGHT
             }
         }
-        edit1H := Max(edit1H, MIN_EDIT_HEIGHT)
-        edit2H := Max(edit2H, MIN_EDIT_HEIGHT)
+        edit1H := Max(edit1H, this.MIN_EDIT_HEIGHT)
+        edit2H := Max(edit2H, this.MIN_EDIT_HEIGHT)
         middleShift := edit1H - coords['edit1'].h
         bottomShift := middleShift + edit2H - coords['edit2'].h
 
@@ -6010,7 +6023,7 @@ class Icons
 class Config {
     ; Keep in sync with ;@Ahk2Exe-SetVersion at the top of the script:
     ; Tools\BuildRelease.ps1 refuses to build when they differ.
-    static VERSION := '1.0.3'
+    static VERSION := '1.0.4'
 
     ; Public keys built into Google's own browser-side clients (Google Translate
     ; website translation and the Google Dictionary extension). They are not the
