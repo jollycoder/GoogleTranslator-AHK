@@ -2,7 +2,7 @@
 #SingleInstance Force
 ;@Ahk2Exe-SetName GoogleTranslator
 ;@Ahk2Exe-SetDescription Google Translate client for Windows
-;@Ahk2Exe-SetVersion 1.0.4
+;@Ahk2Exe-SetVersion 1.1.0
 ;@Ahk2Exe-SetOrigFilename GoogleTranslator.exe
 ; The base path is relative to the compiler folder (AutoHotkey\Compiler).
 ;@Ahk2Exe-Base ..\v2\AutoHotkey64.exe
@@ -1000,15 +1000,15 @@ class GoogleTranslator
             { key: 'darkTheme', iniKey: 'Dark Theme'                        , trayMenuItem: 'Dark Theme'            },
             { key: 'multiGUI' , iniKey: 'Multiple GUIs'                     , trayMenuItem: 'Use Multiple GUIs'     },
             { key: 'noGUI'    , iniKey: 'Windowless Mode'                   , trayMenuItem: 'Windowless Mode'       },
-            { key: 'copyTrans', iniKey: 'Copy Main Translation to Clipboard', trayMenuItem: 'Copy Main Translation' }
+            { key: 'copyTrans', iniKey: 'Copy Main Translation to Clipboard', trayMenuItem: 'Copy Main Translation' },
+            { key: 'rememberSize', iniKey: 'Remember Window Size'           , trayMenuItem: 'Remember Window Size'  }
         ]
         for i, item in this.settings {
             this.%item.key% := IniRead(this.iniPath, 'Settings', item.iniKey, i == 1)
         }
-        this.slTranslatedText := IniRead(this.iniPath, 'Translated', 'Source Language', '')
-        this.tlTranslatedText := IniRead(this.iniPath, 'Translated', 'Target Language', '')
-        this.audioErrorTranslatedText := IniRead(this.iniPath, 'Translated', 'Audio Error', '')
-        this.fontSizeTranslatedText := IniRead(this.iniPath, 'Translated', 'Font Size', '')
+        for textField in this.GetInterfaceTextFields() {
+            this.%textField.propertyName% := IniRead(this.iniPath, 'Translated', textField.iniKey, '')
+        }
         this.cacheSizeMB := RegExReplace(IniRead(this.iniPath, 'Settings', 'Cache Size MB', ''), '\d*\K.*')
         if this.cacheSizeMB == '' && this.isPrimaryScript {
             IniWrite(100, this.iniPath, 'Settings', 'Cache Size MB')
@@ -1336,10 +1336,13 @@ class GoogleTranslator
         A_TrayMenu.Add('Languages...', ObjBindMethod(this, 'ChangeLanguagePair'))
         A_TrayMenu.Add()
         
+        ; With Remember Window Size turned on, the size of the open window is
+        ; the one to keep from then on.
         for s in this.settings {
             A_TrayMenu.Add(s.trayMenuItem, ((s, i, p, m) => (
                 (this.%s.key% ^= 1) ? m.Check(i) : m.UnCheck(i),
                 (i == 'Dark Theme' && TranslateWindow.RedrawGuis(this.darkTheme) && this.FakeGui()),
+                (i == 'Remember Window Size' && this.rememberSize && TranslateWindow.SaveWindowSize(TranslateWindow.lastGui)),
                 IniWrite(this.%s.key%, this.iniPath, 'Settings', s.iniKey)
             )).Bind(s))
             (this.%s.key% && A_TrayMenu.Check(s.trayMenuItem))
@@ -1742,53 +1745,93 @@ class GoogleTranslator
         }
     }
 
+    ; The interface texts are translated into the native language and kept
+    ; in the [Translated] section. They go to Google in one request, a line
+    ; per text, so a source text must not contain a line break. tipIcon names
+    ; the button icon whose tooltip the text is.
+    static GetInterfaceTextFields() {
+        return [
+            { propertyName: 'slTranslatedText'        , iniKey: 'Source Language', tipIcon: '',
+              sourceText: 'Source Language' },
+            { propertyName: 'tlTranslatedText'        , iniKey: 'Target Language', tipIcon: '',
+              sourceText: 'Target Language' },
+            { propertyName: 'audioErrorTranslatedText', iniKey: 'Audio Error'    , tipIcon: '',
+              sourceText: 'Playback error: unsupported language for TTS.' },
+            { propertyName: 'fontSizeTranslatedText'  , iniKey: 'Font Size'      , tipIcon: '',
+              sourceText: 'Font Size' },
+            ; Single words are translated ambiguously ("Stop" as a noun, "Play"
+            ; as a game), so the tooltips are phrases.
+            { propertyName: 'swapTipText'             , iniKey: 'Swap Tip'       , tipIcon: 'swap',
+              sourceText: 'Swap languages' },
+            { propertyName: 'playTipText'             , iniKey: 'Play Tip'       , tipIcon: 'play',
+              sourceText: 'Read aloud' },
+            { propertyName: 'pauseTipText'            , iniKey: 'Pause Tip'      , tipIcon: 'pause',
+              sourceText: 'Pause playback' },
+            { propertyName: 'stopTipText'             , iniKey: 'Stop Tip'       , tipIcon: 'stop',
+              sourceText: 'Stop playback' },
+            { propertyName: 'translateTipText'        , iniKey: 'Translate Tip'  , tipIcon: 'translate',
+              sourceText: 'Translation' },
+            { propertyName: 'backwardTipText'         , iniKey: 'Backward Tip'   , tipIcon: 'backward',
+              sourceText: 'Reverse translation' }
+        ]
+    }
+
+    static HasAllInterfaceTexts() {
+        for textField in this.GetInterfaceTextFields() {
+            if this.%textField.propertyName% == '' {
+                return false
+            }
+        }
+        return true
+    }
+
+    static GetButtonTipText(iconName) {
+        for textField in this.GetInterfaceTextFields() {
+            if textField.tipIcon == iconName {
+                return this.%textField.propertyName%
+            }
+        }
+        return ''
+    }
+
     static GetInterfaceTexts(forceRefresh := false) {
-        slTranslatedText := tlTranslatedText := audioErrorTranslatedText := fontSizeTranslatedText := ''
-        textsAreMissing := this.slTranslatedText == '' || this.tlTranslatedText == ''
-            || this.audioErrorTranslatedText == '' || this.fontSizeTranslatedText == ''
-        if forceRefresh || textsAreMissing {
+        textFields := this.GetInterfaceTextFields()
+        if forceRefresh || !this.HasAllInterfaceTexts() {
+            sourceTexts := ''
+            for textField in textFields {
+                sourceTexts .= (A_Index > 1 ? '`n' : '') . textField.sourceText
+            }
+            translatedTexts := []
             try {
-                res := this.TranslatePage('
-                (
-                    Source Language
-                    Target Language
-                    Playback error: unsupported language for TTS.
-                    Font Size
-                )', this.nativeLanguage, 'en')['trans']
-                res := Trim(res, '`t`n`r ')
-                arr := StrSplit(res, '`n', '`r')
-                if arr.Length < 4 {
+                res := this.TranslatePage(sourceTexts, this.nativeLanguage, 'en')['trans']
+                translatedLines := StrSplit(Trim(res, '`t`n`r '), '`n', '`r')
+                ; A merged or split line would shift every text after it.
+                if translatedLines.Length != textFields.Length {
                     throw Error('Incomplete interface translation')
                 }
-                slTranslatedText := Trim(arr[1])
-                tlTranslatedText := Trim(arr[2])
-                audioErrorTranslatedText := Trim(arr[3])
-                fontSizeTranslatedText := Trim(arr[4])
-            } catch {
-                slTranslatedText         := 'Source Language'
-                tlTranslatedText         := 'Target Language'
-                audioErrorTranslatedText := 'Playback error: unsupported language for TTS.'
-                fontSizeTranslatedText   := 'Font Size'
-            } else {
-                if this.isPrimaryScript {
-                    if forceRefresh || this.slTranslatedText == '' {
-                        IniWrite(slTranslatedText, this.iniPath, 'Translated', 'Source Language')
+                for textField in textFields {
+                    translatedText := Trim(translatedLines[A_Index])
+                    ; A tooltip is a label, not a sentence.
+                    if textField.tipIcon != '' {
+                        translatedText := RTrim(translatedText, '.。')
                     }
-                    if forceRefresh || this.tlTranslatedText == '' {
-                        IniWrite(tlTranslatedText, this.iniPath, 'Translated', 'Target Language')
+                    if translatedText == '' {
+                        throw Error('Incomplete interface translation')
                     }
-                    if forceRefresh || this.audioErrorTranslatedText == '' {
-                        IniWrite(audioErrorTranslatedText, this.iniPath, 'Translated', 'Audio Error')
-                    }
-                    if forceRefresh || this.fontSizeTranslatedText == '' {
-                        IniWrite(fontSizeTranslatedText, this.iniPath, 'Translated', 'Font Size')
-                    }
+                    translatedTexts.Push(translatedText)
                 }
-                if forceRefresh {
-                    this.slTranslatedText := slTranslatedText
-                    this.tlTranslatedText := tlTranslatedText
-                    this.audioErrorTranslatedText := audioErrorTranslatedText
-                    this.fontSizeTranslatedText := fontSizeTranslatedText
+            } catch {
+                ; The stored texts stay; the missing ones are filled in
+                ; English below.
+            } else {
+                for textField in textFields {
+                    if forceRefresh || this.%textField.propertyName% == '' {
+                        this.%textField.propertyName% := translatedTexts[A_Index]
+                        if this.isPrimaryScript {
+                            IniWrite(translatedTexts[A_Index], this.iniPath,
+                                     'Translated', textField.iniKey)
+                        }
+                    }
                 }
                 if this.isPrimaryScript {
                     this.interfaceLocale := this.nativeLanguage
@@ -1797,19 +1840,15 @@ class GoogleTranslator
                 }
             }
         }
-        for i, name in ['slTranslatedText', 'tlTranslatedText', 'audioErrorTranslatedText', 'fontSizeTranslatedText'] {
-            if this.%name% == '' {
-                this.%name% := %name%
+        for textField in textFields {
+            if this.%textField.propertyName% == '' {
+                this.%textField.propertyName% := textField.sourceText
             }
         }
     }
 
     static WaitForReady() {
-        if   this.slTranslatedText
-          && this.tlTranslatedText
-          && this.audioErrorTranslatedText
-          && this.fontSizeTranslatedText
-          && FileExist(A_ScriptDir . '\langlist.json') {
+        if this.HasAllInterfaceTexts() && FileExist(A_ScriptDir . '\langlist.json') {
             return
         }
         this.BlockTrayMenu()
@@ -1872,6 +1911,8 @@ class TranslateWindow
 {
     static guis := LinkedOrderedMap(), lastGui := ''
          , MIN_EDIT_HEIGHT := 60, MAX_AUTO_EDIT_HEIGHT := 350
+         ; Dragging the edge between the fields (FieldSplitter); false turns it off.
+         , FIELD_SPLITTER := true
          , resizeParams := {wnd: ''}
          , adjustLayoutTimer := ObjBindMethod(this, 'AdjustLayout', this.resizeParams)
          , restoreTextTimers := Map(), restoreTextExpected := Map()
@@ -1920,7 +1961,7 @@ class TranslateWindow
         }
         this.lastSl := sl
         SetTimer wnd.waitTimer, tTxt == '' ? 300 : 0
-        (tTxt != '' && this.AdjustGuiSize(wnd, tTxt))
+        (tTxt != '' && !GoogleTranslator.rememberSize && this.AdjustGuiSize(wnd, tTxt))
         return wnd
     }
 
@@ -1939,24 +1980,28 @@ class TranslateWindow
         if !this.HasOwnProp('slArr') {
             this.CreateLangArrays(GoogleTranslator.langList)
         }
-        wnd := this.CreateGui(sl, tl, sTxt, tTxt)
+        savedSize := GoogleTranslator.rememberSize ? this.GetSavedSize() : ''
+        wnd := this.CreateGui(sl, tl, sTxt, tTxt, savedSize)
         wnd.edge := 'right'
         this.StoreHorizontalCoords(wnd)
+        ; A window of the saved width is first shown hidden at its natural
+        ; width: the layout and the minimum size are counted from that.
+        showOptions := savedSize ? ' Hide' : ''
         if this.lastGui {
             if this.GetNormalWindowPosition(this.lastGui.hwnd, &x, &y) {
-                wnd.Show('x' . (x + 30) . ' y' . (y + 30))
+                wnd.Show('x' . (x + 30) . ' y' . (y + 30) . showOptions)
                 this.KeepInWorkArea(wnd.Hwnd)
             } else {
-                wnd.Show()
+                wnd.Show(showOptions)
             }
         } else {
             x := IniRead(this.iniPath, 'Coords', 'GuiX', '')
             y := IniRead(this.iniPath, 'Coords', 'GuiY', '')
             if x == '' || y == '' {
-                wnd.Show()
+                wnd.Show(showOptions)
             } else {
                 ; The saved position may be on a monitor that is gone now.
-                wnd.Show('x' . x . ' y' . y)
+                wnd.Show('x' . x . ' y' . y . showOptions)
                 this.KeepInWorkArea(wnd.Hwnd)
             }
         }
@@ -1980,6 +2025,7 @@ class TranslateWindow
             OnMessage(0x214, this.onSizing     := ObjBindMethod(this, 'WM_SIZING'))
             OnMessage(0x20A, this.onMouseWheel := ObjBindMethod(this, 'WM_MOUSEWHEEL'))
             OnMessage(0x100, this.onKeyDown    := ObjBindMethod(this, 'WM_KEYDOWN'))
+            (this.FIELD_SPLITTER && FieldSplitter.Install())
         }
         ; A window opened with a ready translation (from the cache) already
         ; has a tall bottom field. The minimum size is that of the window
@@ -1991,7 +2037,45 @@ class TranslateWindow
             guiH -= Max(0, editH - this.MIN_EDIT_HEIGHT)
         }
         wnd.Opt('+MinSize' . guiW . 'x' . guiH)
+        if savedSize {
+            width := Max(savedSize.width, guiW)
+            ; Laid out before it is shown, the window does not flash at its
+            ; natural width; the Size event repeats the same layout.
+            this.ResizeHorizontal(wnd, width)
+            wnd.Show('w' . width)
+            this.KeepInWorkArea(wnd.Hwnd)
+        }
         return wnd
+    }
+
+    ; The size kept by "Remember Window Size": the client width and the
+    ; heights of both fields. The window height follows from them, so a
+    ; change of the fixed part of the window does not break the saved size.
+    static GetSavedSize() {
+        width := IniRead(this.iniPath, 'Coords', 'GuiW', '')
+        edit1H := IniRead(this.iniPath, 'Coords', 'Edit1H', '')
+        edit2H := IniRead(this.iniPath, 'Coords', 'Edit2H', '')
+        if !(IsInteger(width) && IsInteger(edit1H) && IsInteger(edit2H)) {
+            return ''
+        }
+        return {
+            width: Integer(width),
+            editHeights: [Max(Integer(edit1H), this.MIN_EDIT_HEIGHT),
+                          Max(Integer(edit2H), this.MIN_EDIT_HEIGHT)]
+        }
+    }
+
+    static SaveWindowSize(wnd) {
+        if !GoogleTranslator.rememberSize || !this.IsAlive(wnd)
+                || WinGetMinMax(wnd.Hwnd) == -1 {
+            return
+        }
+        wnd.GetClientPos(,, &width)
+        wnd.edit1.GetPos(,,, &edit1H)
+        wnd.edit2.GetPos(,,, &edit2H)
+        IniWrite(width, this.iniPath, 'Coords', 'GuiW')
+        IniWrite(edit1H, this.iniPath, 'Coords', 'Edit1H')
+        IniWrite(edit2H, this.iniPath, 'Coords', 'Edit2H')
     }
 
     ; GetWindowPlacement returns the restored position even while the window is
@@ -2057,6 +2141,7 @@ class TranslateWindow
     }
 
     static RemoveGui(hwnd) {
+        FieldSplitter.Forget(hwnd)
         removedWnd := this.guis.Delete(hwnd)
         AudioChannel.RemoveChannel(removedWnd.play1.hwnd)
         AudioChannel.RemoveChannel(removedWnd.play2.hwnd)
@@ -2076,6 +2161,7 @@ class TranslateWindow
             OnMessage(0x214, this.onSizing    , 0)
             OnMessage(0x20A, this.onMouseWheel, 0)
             OnMessage(0x100, this.onKeyDown   , 0)
+            FieldSplitter.Uninstall()
             this.hook := ''
         }
         SetTimer removedWnd.waitTimer, 0
@@ -2104,6 +2190,7 @@ class TranslateWindow
     static FinishResize(wnd) {
         if this.IsAlive(wnd) {
             this.LayoutToClientSize(wnd)
+            this.SaveWindowSize(wnd)
         }
     }
 
@@ -2215,11 +2302,13 @@ class TranslateWindow
         SetTimer timerCallback, 0
     }
 
-    static CreateGui(sl, tl, sTxt, tTxt) {
+    static CreateGui(sl, tl, sTxt, tTxt, savedSize := '') {
         static ES_NOHIDESEL := 0x100, BS_ICON := 0x40
         (sl ~= '^zh(?!-)' && sl := 'zh-TW')
         (tl ~= '^zh(?!-)' && tl := 'zh-TW')
         wnd := Gui('AlwaysOnTop LastFound Resize -MaximizeBox', 'Google Translate')
+        ; SetButtonIcon gives every button its tooltip.
+        wnd.buttonHints := ButtonToolTips(wnd, GoogleTranslator.darkTheme)
         wnd.waitTimer := ObjBindMethod(this, 'WaitForTranslation', wnd)
         wnd.MarginX := wnd.MarginY := 10
         wnd.OnEvent('Close' , (*) => this.RemoveGui(wnd.hwnd))
@@ -2255,6 +2344,7 @@ class TranslateWindow
             (i == 1 && wnd.testTxt := wnd.AddText('xm y+9 Hidden'))
             h := this.GetTextHeight(11, 'Calibri', w, txt)
             switch {
+                case IsObject(savedSize) : hOpt := ' h' . savedSize.editHeights[i]
                 case txt == '' || h < 60 : hOpt := ' h60'
                 case i == 1 && h > 60 : hOpt := ' h60'
                 case i == 2 && h > 350 : hOpt := ' h350'
@@ -2334,6 +2424,7 @@ class TranslateWindow
         for hwnd in this.guis {
             wnd := GuiFromHwnd(hwnd)
             DarkTheme.SetWindowTheme(wnd, theme)
+            (wnd.HasOwnProp('buttonHints') && wnd.buttonHints.ApplyTheme(theme))
             WinRedraw(wnd)
             this.SetSelToCB(wnd.lng1)
             this.SetSelToCB(wnd.lng2)
@@ -2348,6 +2439,14 @@ class TranslateWindow
         static IMAGE_ICON := 1, BM_SETIMAGE := 0xF7
         size := Round(size * A_ScreenDPI / 96)
         PostMessage BM_SETIMAGE, IMAGE_ICON, Icons.Get(icon, size), ctrl
+        ; The tooltip follows the icon: the play button tells whether it
+        ; starts or pauses playback.
+        try buttonHints := ctrl.Gui.buttonHints
+        catch {
+            return
+        }
+        tipText := GoogleTranslator.GetButtonTipText(icon)
+        (tipText != '' && buttonHints.SetText(ctrl, tipText))
     }
 
     static GetTextFromField(wnd, fieldNum) {
@@ -2657,8 +2756,13 @@ class TranslateWindow
                 edit2H := this.MIN_EDIT_HEIGHT
             }
         }
-        edit1H := Max(edit1H, this.MIN_EDIT_HEIGHT)
-        edit2H := Max(edit2H, this.MIN_EDIT_HEIGHT)
+        this.PlaceFields(wnd, Max(edit1H, this.MIN_EDIT_HEIGHT), Max(edit2H, this.MIN_EDIT_HEIGHT))
+    }
+
+    ; Gives the fields these heights, the controls below each field following
+    ; it, all counted from the positions stored by StoreVerticalCoords.
+    static PlaceFields(wnd, edit1H, edit2H) {
+        coords := wnd.coords
         middleShift := edit1H - coords['edit1'].h
         bottomShift := middleShift + edit2H - coords['edit2'].h
 
@@ -2670,6 +2774,15 @@ class TranslateWindow
         for ctrl in ['play2', 'stop2', 'trans2'] {
             this.PlaceControl(wnd.%ctrl%, coords[ctrl].y + bottomShift)
         }
+    }
+
+    ; Moves the edge between the fields by delta, keeping the window height:
+    ; one field takes from the other, neither below its minimum.
+    static SplitFields(wnd, delta) {
+        edit1H := wnd.coords['edit1'].h
+        edit2H := wnd.coords['edit2'].h
+        delta := Max(this.MIN_EDIT_HEIGHT - edit1H, Min(delta, edit2H - this.MIN_EDIT_HEIGHT))
+        this.PlaceFields(wnd, edit1H + delta, edit2H - delta)
     }
 
     ; Moves and redraws a control only when its place changes: redrawing
@@ -5810,6 +5923,273 @@ RegisterSyncCallback(funcObj, options := '', paramCount?) {
     }
 }
 
+; Changes the ratio of the two fields of a translation window: the bottom
+; edge of the top field and the top edge of the bottom one can be dragged,
+; each with the gap next to it and the border of the field. TranslateWindow
+; only installs and removes it, so TranslateWindow.FIELD_SPLITTER := false
+; turns the feature off. Points are screen pixels, heights are the GUI
+; units of GetPos and Move.
+class FieldSplitter
+{
+    static dragWnd := '', dragStartY := 0, monitors := ''
+
+    static Install() {
+        if IsObject(this.monitors) {
+            return
+        }
+        this.monitors := Map(
+            0x0020, ObjBindMethod(this, 'WM_SETCURSOR'),
+            0x0200, ObjBindMethod(this, 'WM_MOUSEMOVE'),
+            0x0201, ObjBindMethod(this, 'OnButtonDown'),    ; WM_LBUTTONDOWN
+            0x00A1, ObjBindMethod(this, 'OnButtonDown'),    ; WM_NCLBUTTONDOWN, on the border of a field
+            0x0202, ObjBindMethod(this, 'WM_LBUTTONUP'),
+            0x0215, ObjBindMethod(this, 'WM_CAPTURECHANGED')
+        )
+        ; Called first: a press on the edge must not reach the handler that
+        ; drags the whole window by its client area.
+        for msg, monitor in this.monitors {
+            OnMessage(msg, monitor, -1)
+        }
+    }
+
+    static Uninstall() {
+        if !IsObject(this.monitors) {
+            return
+        }
+        this.EndDrag()
+        for msg, monitor in this.monitors {
+            OnMessage(msg, monitor, 0)
+        }
+        this.monitors := ''
+    }
+
+    ; Called before a window is closed: a drag in it ends without saving.
+    static Forget(hwnd) {
+        if IsObject(this.dragWnd) && this.dragWnd.Hwnd == hwnd {
+            this.dragWnd := ''
+            if DllCall('GetCapture', 'Ptr') == hwnd {
+                DllCall('ReleaseCapture')
+            }
+        }
+    }
+
+    ; Whether the point is on one of the two edges.
+    static HitTest(wnd, x, y) {
+        topField := this.GetScreenRect(wnd.edit1)
+        bottomField := this.GetScreenRect(wnd.edit2)
+        buttonsTop := this.GetScreenRect(wnd.play1).top
+        languageRowBottom := Max(this.GetScreenRect(wnd.txt2).bottom,
+                                 this.GetScreenRect(wnd.lng2).bottom,
+                                 this.GetScreenRect(wnd.swapLang2).bottom)
+        return (x >= topField.left && x < topField.right
+                    && y >= topField.bottom - topField.border && y < buttonsTop)
+            || (x >= bottomField.left && x < bottomField.right
+                    && y >= languageRowBottom && y < bottomField.top + bottomField.border)
+    }
+
+    ; The ratio can change only while a field is above its minimum.
+    static CanSplit(wnd) {
+        wnd.edit1.GetPos(,,, &edit1H)
+        wnd.edit2.GetPos(,,, &edit2H)
+        return edit1H + edit2H > TranslateWindow.MIN_EDIT_HEIGHT * 2 + 1
+    }
+
+    static BeginDrag(wnd, startY) {
+        TranslateWindow.StoreVerticalCoords(wnd)
+        this.dragWnd := wnd
+        this.dragStartY := startY
+        DllCall('SetCapture', 'Ptr', wnd.Hwnd)
+        this.SetSizeCursor()
+    }
+
+    static DragTo(y) {
+        wnd := this.dragWnd
+        if !TranslateWindow.IsAlive(wnd) {
+            this.EndDrag()
+            return
+        }
+        TranslateWindow.SplitFields(wnd, Round((y - this.dragStartY) * 96 / A_ScreenDPI))
+    }
+
+    ; The positions are stored anew, or the next resize of the window would
+    ; lay it out by the ratio from before the drag.
+    static EndDrag() {
+        wnd := this.dragWnd
+        if !IsObject(wnd) {
+            return
+        }
+        this.dragWnd := ''
+        if DllCall('GetCapture', 'Ptr') == wnd.Hwnd {
+            DllCall('ReleaseCapture')
+        }
+        if TranslateWindow.IsAlive(wnd) {
+            TranslateWindow.StoreVerticalCoords(wnd)
+            TranslateWindow.SaveWindowSize(wnd)
+        }
+    }
+
+    static WM_SETCURSOR(wParam, lParam, msg, hwnd) {
+        if IsObject(this.dragWnd) {
+            this.SetSizeCursor()
+            return true
+        }
+        ; A child window passes the message to its parent first, so the
+        ; translation window gets it for the borders of the fields too.
+        if !TranslateWindow.guis.Has(hwnd) {
+            return
+        }
+        wnd := TranslateWindow.guis[hwnd]
+        this.GetCursorPoint(&x, &y)
+        if this.CanSplit(wnd) && this.HitTest(wnd, x, y) {
+            this.SetSizeCursor()
+            return true
+        }
+    }
+
+    static OnButtonDown(wParam, lParam, msg, hwnd) {
+        static WM_NCLBUTTONDOWN := 0xA1, HTCAPTION := 2
+        ; The press on the client area is turned into this one to drag the
+        ; window, and the caption is no edge.
+        if msg == WM_NCLBUTTONDOWN && wParam == HTCAPTION {
+            return
+        }
+        wnd := this.GetTranslationWindow(hwnd)
+        if !IsObject(wnd) {
+            return
+        }
+        this.GetCursorPoint(&x, &y)
+        if !this.CanSplit(wnd) || !this.HitTest(wnd, x, y) {
+            return
+        }
+        this.BeginDrag(wnd, y)
+        return 0
+    }
+
+    static WM_MOUSEMOVE(wParam, lParam, msg, hwnd) {
+        if !IsObject(this.dragWnd) {
+            return
+        }
+        this.SetSizeCursor()
+        this.GetCursorPoint(, &y)
+        this.DragTo(y)
+        return 0
+    }
+
+    static WM_LBUTTONUP(wParam, lParam, msg, hwnd) {
+        if !IsObject(this.dragWnd) {
+            return
+        }
+        this.EndDrag()
+        return 0
+    }
+
+    ; The capture is lost when another window takes the mouse, for example
+    ; on Alt+Tab.
+    static WM_CAPTURECHANGED(wParam, lParam, msg, hwnd) {
+        if IsObject(this.dragWnd) && hwnd == this.dragWnd.Hwnd {
+            this.EndDrag()
+        }
+    }
+
+    static GetTranslationWindow(hwnd) {
+        if TranslateWindow.guis.Has(hwnd) {
+            return TranslateWindow.guis[hwnd]
+        }
+        ctrl := GuiCtrlFromHwnd(hwnd)
+        if ctrl && TranslateWindow.guis.Has(ctrl.Gui.Hwnd) {
+            return TranslateWindow.guis[ctrl.Gui.Hwnd]
+        }
+        return ''
+    }
+
+    ; The screen rectangle of a control and the width of its border.
+    static GetScreenRect(ctrl) {
+        windowRect := Buffer(16)
+        clientRect := Buffer(16)
+        DllCall('GetWindowRect', 'Ptr', ctrl.Hwnd, 'Ptr', windowRect)
+        DllCall('GetClientRect', 'Ptr', ctrl.Hwnd, 'Ptr', clientRect)
+        top := NumGet(windowRect, 4, 'Int')
+        bottom := NumGet(windowRect, 12, 'Int')
+        return {
+            left: NumGet(windowRect, 0, 'Int'),
+            top: top,
+            right: NumGet(windowRect, 8, 'Int'),
+            bottom: bottom,
+            border: Max(0, (bottom - top - NumGet(clientRect, 12, 'Int')) // 2)
+        }
+    }
+
+    static GetCursorPoint(&x := 0, &y := 0) {
+        DllCall('GetCursorPos', 'Int64P', &point := 0)
+        x := point << 32 >> 32
+        y := point >> 32
+    }
+
+    static SetSizeCursor() {
+        static IDC_SIZENS := 32645
+        DllCall('SetCursor', 'Ptr', DllCall('LoadCursor', 'Ptr', 0, 'Ptr', IDC_SIZENS, 'Ptr'), 'Ptr')
+    }
+}
+
+; The tooltips of the buttons of a translation window, one tooltip control
+; per window. Visual styles are turned off for it: a themed tooltip ignores
+; the colors set for it, and the colors must follow the theme of the window.
+; The control belongs to the window and is destroyed with it.
+class ButtonToolTips
+{
+    static LIGHT_BACKGROUND := 0xFFFFFF, LIGHT_TEXT := 0x202020
+         , AUTOPOP_MS := 3000   ; how long a tooltip stays while the pointer rests
+
+    __New(ownerWnd, darkMode := false) {
+        static WS_EX_TOPMOST := 0x8, TTS_ALWAYSTIP := 0x1, TTS_NOPREFIX := 0x2
+             , TTM_SETMARGIN := 0x41A, TTM_SETDELAYTIME := 0x403, TTDT_AUTOPOP := 2
+        this.ownerHwnd := ownerWnd.Hwnd
+        this.toolHwnds := Map()
+        ; TTS_ALWAYSTIP: the window is often inactive while it is used.
+        this.hwnd := DllCall('CreateWindowEx', 'UInt', WS_EX_TOPMOST, 'Str', 'tooltips_class32',
+                             'Ptr', 0, 'UInt', TTS_ALWAYSTIP | TTS_NOPREFIX,
+                             'Int', 0, 'Int', 0, 'Int', 0, 'Int', 0,
+                             'Ptr', this.ownerHwnd, 'Ptr', 0, 'Ptr', 0, 'Ptr', 0, 'Ptr')
+        if !this.hwnd {
+            throw OSError(A_LastError, -1, 'Unable to create the button tooltips')
+        }
+        DllCall('UxTheme\SetWindowTheme', 'Ptr', this.hwnd, 'Ptr', 0, 'Str', '')
+        ; Without a theme the text touches the border.
+        horizontalMargin := Round(4 * A_ScreenDPI / 96)
+        verticalMargin := Round(2 * A_ScreenDPI / 96)
+        marginRect := Buffer(16)
+        NumPut('Int', horizontalMargin, 'Int', verticalMargin,
+               'Int', horizontalMargin, 'Int', verticalMargin, marginRect)
+        SendMessage(TTM_SETMARGIN, 0, marginRect, this.hwnd)
+        SendMessage(TTM_SETDELAYTIME, TTDT_AUTOPOP, ButtonToolTips.AUTOPOP_MS, this.hwnd)
+        this.ApplyTheme(darkMode)
+    }
+
+    ; Adds the tooltip of a button or replaces its text. The control keeps
+    ; its own copy of the text.
+    SetText(ctrl, tipText) {
+        static TTF_IDISHWND := 0x1, TTF_SUBCLASS := 0x10
+             , TTM_ADDTOOLW := 0x432, TTM_UPDATETIPTEXTW := 0x439
+        toolInfo := Buffer(24 + A_PtrSize * 6, 0)   ; TTTOOLINFOW
+        NumPut('UInt', toolInfo.Size, 'UInt', TTF_IDISHWND | TTF_SUBCLASS,
+               'Ptr', this.ownerHwnd, 'Ptr', ctrl.Hwnd, toolInfo)
+        NumPut('Ptr', StrPtr(tipText), toolInfo, 24 + A_PtrSize * 3)   ; lpszText
+        if this.toolHwnds.Has(ctrl.Hwnd) {
+            SendMessage(TTM_UPDATETIPTEXTW, 0, toolInfo, this.hwnd)
+        } else if SendMessage(TTM_ADDTOOLW, 0, toolInfo, this.hwnd) {
+            this.toolHwnds[ctrl.Hwnd] := true
+        }
+    }
+
+    ApplyTheme(darkMode) {
+        static TTM_SETTIPBKCOLOR := 0x413, TTM_SETTIPTEXTCOLOR := 0x414
+        backColor := darkMode ? DarkTheme.DarkColors['Controls'] : ButtonToolTips.LIGHT_BACKGROUND
+        textColor := darkMode ? DarkTheme.DarkColors['Font'] : ButtonToolTips.LIGHT_TEXT
+        SendMessage(TTM_SETTIPBKCOLOR, backColor, 0, this.hwnd)
+        SendMessage(TTM_SETTIPTEXTCOLOR, textColor, 0, this.hwnd)
+    }
+}
+
 class DarkTheme
 {
     static DarkColors := Map('Background', 0x202020, 'Controls', 0x404040, 'Font', 0xE0E0E0)
@@ -6023,7 +6403,7 @@ class Icons
 class Config {
     ; Keep in sync with ;@Ahk2Exe-SetVersion at the top of the script:
     ; Tools\BuildRelease.ps1 refuses to build when they differ.
-    static VERSION := '1.0.4'
+    static VERSION := '1.1.0'
 
     ; Public keys built into Google's own browser-side clients (Google Translate
     ; website translation and the Google Dictionary extension). They are not the

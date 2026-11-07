@@ -29,9 +29,9 @@ When translating selected text, the program tries to determine which language in
 
 In the top field, you can type or paste the source text, select the source and target languages, then click the translate button or press `Enter`. If a fragment is selected in the field, that fragment is translated. To insert a line break, press `Shift+Enter`.
 
-The reverse translation button translates text from the bottom field in the opposite direction. Pressing `Enter` in the bottom field does the same. The buttons next to the language lists swap the source and target languages.
+The reverse translation button translates text from the bottom field in the opposite direction. Pressing `Enter` in the bottom field does the same. The buttons next to the language lists swap the source and target languages. Pointing to a button shows a tooltip in your native language.
 
-You can resize the window with the mouse: dragging the top edge enlarges the top text field, while dragging the bottom edge enlarges the bottom field. To change the font size of an individual field, point to it, hold `Ctrl`, and scroll the mouse wheel.
+You can resize the window with the mouse: dragging the top edge enlarges the top text field, while dragging the bottom edge enlarges the bottom field. To change the ratio of the fields without changing the window height, drag the bottom edge of the top field or the top edge of the bottom one. After a translation, the bottom field grows to fit it, unless `Remember Window Size` is turned on in the tray menu. To change the font size of an individual field, point to it, hold `Ctrl`, and scroll the mouse wheel.
 
 ## Tray menu
 
@@ -45,6 +45,7 @@ Right-click the program's tray icon to open the settings menu. The main commands
 | `Use Multiple GUIs` | Open a separate window for each new translation |
 | `Windowless Mode` | Translate selected text without showing the window and replace the selection with the translation. If you switch to another window or field before the translation arrives, it is only copied to the clipboard |
 | `Copy Main Translation` | Automatically copy the main translation to the clipboard |
+| `Remember Window Size` | Keep the window width and the heights of both text fields: new windows open with this size, and a translation does not resize the window |
 | `Add To Startup` | Enable or disable starting the program with Windows |
 | `Clear Cache` | Clear cached translations and speech |
 
