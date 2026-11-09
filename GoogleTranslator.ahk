@@ -2,7 +2,7 @@
 #SingleInstance Force
 ;@Ahk2Exe-SetName GoogleTranslator
 ;@Ahk2Exe-SetDescription Google Translate client for Windows
-;@Ahk2Exe-SetVersion 1.1.1
+;@Ahk2Exe-SetVersion 1.1.2
 ;@Ahk2Exe-SetOrigFilename GoogleTranslator.exe
 ; The base path is relative to the compiler folder (AutoHotkey\Compiler).
 ;@Ahk2Exe-Base ..\v2\AutoHotkey64.exe
@@ -782,9 +782,8 @@ class GoogleTranslator
         this.cache := this.OpenCache(A_ScriptDir . '\translate.cache',
                                      this.cacheSizeMB ? Number(this.cacheSizeMB) * 1024 * 1024 : '')
         if this.isPrimaryScript && this.cache is DisabledTranslationCache {
-            MsgBox('The translation cache could not be opened and is disabled '
-                 . 'until the program restarts.`n`n' . this.cache.reason,
-                   'Google Translate', 48)
+            this.ShowStartupError('The translation cache could not be opened and is disabled '
+                                . 'until the program restarts.`n`n' . this.cache.reason, 'Icon!')
         }
         this.oxfordAudioUrls := Map()
         this.CreateTrayMenu()
@@ -1269,6 +1268,18 @@ class GoogleTranslator
         DarkTheme.SetWindowTheme(setupWnd, this.darkTheme)
     }
 
+    ; The loading window is always on top and would cover a message box shown
+    ; while it is on the screen, so it is hidden for the time of the message.
+    static ShowStartupError(message, options) {
+        static MB_TOPMOST := 0x40000
+        infoGuiWasHidden := this.HideInfoGuiForLanguageSetup()
+        choice := MsgBox(message, 'Google Translate', options . ' ' . MB_TOPMOST)
+        if infoGuiWasHidden {
+            try this.infoGui.Show('NA')
+        }
+        return choice
+    }
+
     static HideInfoGuiForLanguageSetup() {
         if !this.HasOwnProp('infoGui') {
             return false
@@ -1625,7 +1636,13 @@ class GoogleTranslator
                     if !this.isPrimaryScript {
                         return false
                     }
-                    MsgBox 'Failed to fetch language list: ' . e.message, 'Error', 16
+                    choice := this.ShowStartupError('Failed to fetch the language list:`n'
+                        . e.Message . '`n`nCheck the internet connection. If you use a VPN '
+                        . 'or a proxy, try turning it off or excluding this program from it.',
+                        'RetryCancel Iconx')
+                    if choice == 'Retry' {
+                        return this.GetLanguageList(forceRefresh)
+                    }
                     ExitApp()
                 }
             } else {
@@ -1648,7 +1665,7 @@ class GoogleTranslator
             if !this.isPrimaryScript || this.HasOwnProp('langList') {
                 return false
             }
-            MsgBox 'Failed to read the language list: ' . parseError.Message, 'Error', 16
+            this.ShowStartupError('Failed to read the language list: ' . parseError.Message, 'Iconx')
             ExitApp()
         }
         return true
@@ -6430,7 +6447,7 @@ class Icons
 class Config {
     ; Keep in sync with ;@Ahk2Exe-SetVersion at the top of the script:
     ; Tools\BuildRelease.ps1 refuses to build when they differ.
-    static VERSION := '1.1.1'
+    static VERSION := '1.1.2'
 
     ; Public keys built into Google's own browser-side clients (Google Translate
     ; website translation and the Google Dictionary extension). They are not the
