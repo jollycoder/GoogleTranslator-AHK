@@ -2,7 +2,7 @@
 #SingleInstance Force
 ;@Ahk2Exe-SetName GoogleTranslator
 ;@Ahk2Exe-SetDescription Google Translate client for Windows
-;@Ahk2Exe-SetVersion 1.1.2
+;@Ahk2Exe-SetVersion 1.2.0
 ;@Ahk2Exe-SetOrigFilename GoogleTranslator.exe
 ; The base path is relative to the compiler folder (AutoHotkey\Compiler).
 ;@Ahk2Exe-Base ..\v2\AutoHotkey64.exe
@@ -119,9 +119,20 @@ class WindowsLanguagePreferences
     static MUI_LANGUAGE_NAME := 0x8
     static LOCALE_NAME_MAX_LENGTH := 85
 
+    ; The Windows display language comes first: it is taken as the native
+    ; language, whatever the order of the user's language list, which may
+    ; start with another language. The list gives the second one.
     static GetPreferences() {
         preferredTags := [], fallbackTags := []
-        try preferredTags := this.GetUserLanguageTags()
+        try {
+            uiTag := this.GetUserUiLanguageTag()
+            (uiTag != '' && preferredTags.Push(uiTag))
+        }
+        try {
+            for languageTag in this.GetUserLanguageTags() {
+                this._AppendUnique(preferredTags, languageTag)
+            }
+        }
         try this._AppendPreferredUiLanguages(fallbackTags)
         try this._AppendDefaultLocale(fallbackTags)
         try this._AppendInputLocale(fallbackTags)
@@ -186,6 +197,19 @@ class WindowsLanguagePreferences
         }
     }
 
+    ; The display language of the user (GetUserDefaultUILanguage), as a tag.
+    static GetUserUiLanguageTag() {
+        languageId := DllCall('Kernel32\GetUserDefaultUILanguage', 'UShort')
+        if !languageId {
+            return ''
+        }
+        localeNameBuffer := Buffer(this.LOCALE_NAME_MAX_LENGTH * 2, 0)
+        writtenChars := DllCall('Kernel32\LCIDToLocaleName',
+                                'UInt', languageId, 'Ptr', localeNameBuffer,
+                                'Int', this.LOCALE_NAME_MAX_LENGTH, 'UInt', 0, 'Int')
+        return writtenChars > 1 ? StrGet(localeNameBuffer.Ptr, 'UTF-16') : ''
+    }
+
     static _AppendPreferredUiLanguages(languageTags) {
         languageCount := requiredChars := 0
         if !DllCall('Kernel32\GetUserPreferredUILanguages',
@@ -244,8 +268,7 @@ class WindowsLanguagePreferences
 }
 
 ; Maps Windows language tags to Google codes and chooses a supported pair.
-; Only two explicit user preferences justify auto-save. Other Windows hints
-; and the English fallback may prefill setup, but require confirmation.
+; The pair is only a suggestion: the setup window offers it for confirmation.
 class LanguagePairAdvisor
 {
     static Suggest(preferredTags, supportedLanguages, fallbackTags := unset,
@@ -274,10 +297,7 @@ class LanguagePairAdvisor
 
         return {
             nativeLanguage: nativeLanguage,
-            oppositeLanguage: oppositeLanguage,
-            canAutoSave: savedNativeLanguage == '' && savedOppositeLanguage == ''
-                && preferredLanguages.Length > 1
-                && this.IsValidPair(nativeLanguage, oppositeLanguage)
+            oppositeLanguage: oppositeLanguage
         }
     }
 
@@ -998,12 +1018,17 @@ class GoogleTranslator
         this.settings := [
             { key: 'darkTheme', iniKey: 'Dark Theme'                        , trayMenuItem: 'Dark Theme'            },
             { key: 'multiGUI' , iniKey: 'Multiple GUIs'                     , trayMenuItem: 'Use Multiple GUIs'     },
-            { key: 'noGUI'    , iniKey: 'Windowless Mode'                   , trayMenuItem: 'Windowless Mode'       },
+            { key: 'noGUI'    , iniKey: 'Windowless Mode'                   , trayMenuItem: 'Windowless Mode'       ,
+              topLevel: true },
             { key: 'copyTrans', iniKey: 'Copy Main Translation to Clipboard', trayMenuItem: 'Copy Main Translation' },
-            { key: 'rememberSize', iniKey: 'Remember Window Size'           , trayMenuItem: 'Remember Window Size'  }
+            { key: 'rememberSize', iniKey: 'Remember Window Size'           , trayMenuItem: 'Remember Window Size'  },
+            { key: 'switchLayout', iniKey: 'Switch Keyboard Layout'         , trayMenuItem: 'Switch Keyboard Layout',
+              defaultValue: 1 },
+            { key: 'showRoman', iniKey: 'Show Romanization'                 , trayMenuItem: 'Show Romanization'     }
         ]
         for i, item in this.settings {
-            this.%item.key% := IniRead(this.iniPath, 'Settings', item.iniKey, i == 1)
+            this.%item.key% := IniRead(this.iniPath, 'Settings', item.iniKey,
+                                       item.HasOwnProp('defaultValue') ? item.defaultValue : i == 1)
         }
         for textField in this.GetInterfaceTextFields() {
             this.%textField.propertyName% := IniRead(this.iniPath, 'Translated', textField.iniKey, '')
@@ -1051,10 +1076,11 @@ class GoogleTranslator
         return false
     }
 
-    static ShouldShowLanguageSetup(savedPairIsValid, hasSavedLanguageValue,
-                                   canAutoSave, forceLanguageSetup := false) {
-        return forceLanguageSetup
-            || (!savedPairIsValid && (hasSavedLanguageValue || !canAutoSave))
+    ; Without a valid saved pair the guess from the Windows languages is only
+    ; offered for confirmation: the first Windows language is often that of
+    ; the Windows interface, not the user's native one.
+    static ShouldShowLanguageSetup(savedPairIsValid, forceLanguageSetup := false) {
+        return forceLanguageSetup || !savedPairIsValid
     }
 
     static FinalizeLanguageSettings() {
@@ -1073,8 +1099,7 @@ class GoogleTranslator
                 this.SaveLanguagePair(savedNativeLanguage, savedOppositeLanguage)
             }
             shouldShowSetup := this.isPrimaryScript
-                && this.ShouldShowLanguageSetup(true, true, true,
-                                                this.forceLanguageSetup)
+                && this.ShouldShowLanguageSetup(true, this.forceLanguageSetup)
             if shouldShowSetup {
                 selectedPair := this.ShowLanguageSetup(savedNativeLanguage,
                                                        savedOppositeLanguage)
@@ -1102,12 +1127,7 @@ class GoogleTranslator
                                                     this.oppositeLanguage)
         }
 
-        hasSavedLanguageValue := this.storedNativeLanguage != ''
-            || this.storedOppositeLanguage != ''
-        shouldShowSetup := this.ShouldShowLanguageSetup(false,
-                                                        hasSavedLanguageValue,
-                                                        suggestion.canAutoSave,
-                                                        this.forceLanguageSetup)
+        shouldShowSetup := this.ShouldShowLanguageSetup(false, this.forceLanguageSetup)
         if !shouldShowSetup {
             this.SaveLanguagePair(suggestion.nativeLanguage, suggestion.oppositeLanguage)
             return true
@@ -1347,17 +1367,23 @@ class GoogleTranslator
         A_TrayMenu.Add('Languages...', ObjBindMethod(this, 'ChangeLanguagePair'))
         A_TrayMenu.Add()
         
-        ; With Remember Window Size turned on, the size of the open window is
-        ; the one to keep from then on.
+        ; The on/off settings are in the Options submenu, except those switched
+        ; often (topLevel), which are in the menu itself. With Remember Window
+        ; Size turned on, the size of the open window is the one to keep from
+        ; then on.
+        optionsMenu := Menu()
         for s in this.settings {
-            A_TrayMenu.Add(s.trayMenuItem, ((s, i, p, m) => (
+            settingMenu := s.HasOwnProp('topLevel') && s.topLevel ? A_TrayMenu : optionsMenu
+            settingMenu.Add(s.trayMenuItem, ((s, i, p, m) => (
                 (this.%s.key% ^= 1) ? m.Check(i) : m.UnCheck(i),
                 (i == 'Dark Theme' && TranslateWindow.RedrawGuis(this.darkTheme) && this.FakeGui()),
                 (i == 'Remember Window Size' && this.rememberSize && TranslateWindow.SaveWindowSize(TranslateWindow.lastGui)),
+                (i == 'Show Romanization' && TranslateWindow.OnRomanizationToggled()),
                 IniWrite(this.%s.key%, this.iniPath, 'Settings', s.iniKey)
             )).Bind(s))
-            (this.%s.key% && A_TrayMenu.Check(s.trayMenuItem))
+            (this.%s.key% && settingMenu.Check(s.trayMenuItem))
         }
+        A_TrayMenu.Add('Options', optionsMenu)
         A_TrayMenu.Add()
 
         A_TrayMenu.Add('Add To Startup', AddToStartup)
@@ -1382,6 +1408,7 @@ class GoogleTranslator
 
         ClearCache(*) {
             this.cache.Clear()
+            this.romanSessionCache.Clear()
         }
 
         AddToStartup(i, p, m) {
@@ -1541,6 +1568,105 @@ class GoogleTranslator
         for chunk in this.SmartSplit(text, splitLen) {
             this.AppendTranslatePageChunks(chunk, maxEncodedLen, chunks)
         }
+    }
+
+    ; True for a text with letters outside the Latin script. Text in Latin
+    ; script needs no romanization: for English Google gives the phonetic
+    ; spelling.
+    static NeedsRomanization(text) => RegExMatch(text, '[^\P{L}\p{Latin}]') > 0
+
+    ; Only translate_a/single gives romanization (dt=rm). Google may answer a
+    ; client with HTTP 429 (a "Sorry..." page) when it takes the traffic of a
+    ; network for automated: on one computer client=gtx was blocked on every
+    ; host while client=dict-chrome-ex was answered (Tests\TransliterationProbe.ahk).
+    ; So the endpoints are tried in turn, and a blocked one is skipped for
+    ; ROMAN_BLOCK_MS. While all are blocked no request is sent and no strip
+    ; is shown, so the window does not grow and shrink back with every
+    ; translation. All of them give the same answer.
+    static ROMAN_ENDPOINTS := [
+              'https://translate.googleapis.com/translate_a/single?client=dict-chrome-ex&dt=rm',
+              'https://clients5.google.com/translate_a/single?client=dict-chrome-ex&dt=rm',
+              'https://translate.googleapis.com/translate_a/single?client=gtx&dt=rm'
+           ]
+         , ROMAN_BLOCK_MS := 10 * 60 * 1000
+         , romanBlockedUntil := [0, 0, 0]   ; A_TickCount, per endpoint
+         , romanSessionCache := Map()       ; in front of the disk cache, emptied by Clear Cache
+    static IsRomanizationBlocked() {
+        for blockedUntil in this.romanBlockedUntil {
+            if A_TickCount >= blockedUntil {
+                return false
+            }
+        }
+        return true
+    }
+
+    ; The romanization of a text (pinyin, romaji, transliterated Cyrillic), or
+    ; an empty string. Nothing else in the program depends on these
+    ; endpoints: if Google changes them, only the romanization is lost.
+    ; Answers are kept for the session, and found romanizations also in the
+    ; disk cache with the translations, so a text translated again does not
+    ; ask Google even after a restart. Errors are not kept: the next attempt
+    ; asks again.
+    static Romanize(text, sl := 'auto') {
+        static hdrs := Map(
+                  'User-Agent'  , 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                                . 'AppleWebKit/537.36 (KHTML, like Gecko) '
+                                . 'Chrome/138.0.0.0 Safari/537.36',
+                  'Content-Type', 'application/x-www-form-urlencoded;charset=UTF-8'
+               )
+             , MAX_CHARS := 5000, MAX_CACHED := 200
+        text := Trim(text, ' `t`r`n')
+        if text == '' || StrLen(text) > MAX_CHARS || !this.NeedsRomanization(text)
+                || this.IsRomanizationBlocked() {
+            return ''
+        }
+        sl := (sl == '' ? 'auto' : sl)
+        cacheKey := sl . '|' . text
+        sessionCache := this.romanSessionCache
+        if sessionCache.Has(cacheKey) {
+            return sessionCache[cacheKey]
+        }
+        storedRoman := ''
+        try storedRoman := this.cache.GetRoman(text, sl)
+        if storedRoman != '' {
+            (sessionCache.Count >= MAX_CACHED && sessionCache.Clear())
+            sessionCache[cacheKey] := storedRoman
+            return storedRoman
+        }
+        ; The target language does not matter for dt=rm, but it must differ
+        ; from the source one.
+        tl := (sl = 'en' ? 'ru' : 'en')
+        for endpointIndex, endpoint in this.ROMAN_ENDPOINTS {
+            if A_TickCount < this.romanBlockedUntil[endpointIndex] {
+                continue
+            }
+            roman := ''
+            try {
+                ; POST: the text may be too long for a URL.
+                res := this.wr.Fetch(endpoint . '&sl=' . sl . '&tl=' . tl, 'POST', hdrs,
+                                     'q=' . UrlCodec.Encode(text))
+                ; [[[null, null, null, "Nǐ hǎo"]], null, "zh-CN", ...]
+                for segment in LightJson.Parse(res.text)[1] {
+                    if segment is Array && segment.Length >= 4 && segment[4] is String {
+                        roman .= segment[4]
+                    }
+                }
+            } catch Error as requestError {
+                if requestError.Message ~= '^HTTP (429|403)\b' {
+                    this.romanBlockedUntil[endpointIndex] := A_TickCount + this.ROMAN_BLOCK_MS
+                    continue
+                }
+                ; A network error or an answer of another shape: another
+                ; endpoint would not do better.
+                return ''
+            }
+            (roman == text && roman := '')
+            (sessionCache.Count >= MAX_CACHED && sessionCache.Clear())
+            sessionCache[cacheKey] := roman
+            (roman != '' && this.HasOwnProp('cache') && this.cache.SetRoman(text, sl, roman))
+            return roman
+        }
+        return ''
     }
 
     static TranslatePage(text, tl, sl := 'auto') {
@@ -1780,6 +1906,8 @@ class GoogleTranslator
             ; as a game), so the tooltips are phrases.
             { propertyName: 'swapTipText'             , iniKey: 'Swap Tip'       , tipIcon: 'swap',
               sourceText: 'Swap languages' },
+            { propertyName: 'swapAutoNoticeText'      , iniKey: 'Swap Auto Notice', tipIcon: '',
+              sourceText: 'Select a specific source language to swap languages.' },
             { propertyName: 'playTipText'             , iniKey: 'Play Tip'       , tipIcon: 'play',
               sourceText: 'Read aloud' },
             { propertyName: 'pauseTipText'            , iniKey: 'Pause Tip'      , tipIcon: 'pause',
@@ -1791,6 +1919,20 @@ class GoogleTranslator
             { propertyName: 'backwardTipText'         , iniKey: 'Backward Tip'   , tipIcon: 'backward',
               sourceText: 'Reverse translation' }
         ]
+    }
+
+    ; An interface text, or its English source while there is no translation
+    ; (for example, Google was unreachable at startup).
+    static InterfaceTextOrSource(propertyName) {
+        if this.%propertyName% != '' {
+            return this.%propertyName%
+        }
+        for textField in this.GetInterfaceTextFields() {
+            if textField.propertyName = propertyName {
+                return textField.sourceText
+            }
+        }
+        return ''
     }
 
     static HasAllInterfaceTexts() {
@@ -1870,7 +2012,9 @@ class GoogleTranslator
         }
         this.BlockTrayMenu()
         this.CreateInfoGui()
-        SetTimer ObjBindMethod(this, 'UpdateInfoGui'), 400
+        ; The timer keeps its own window: another CreateInfoGui (the tests make
+        ; one while it may still be running) must not take it over.
+        SetTimer ObjBindMethod(this, 'UpdateInfoGui', this.infoGui), 400
     }
 
     static CreateInfoGui() {
@@ -1895,16 +2039,16 @@ class GoogleTranslator
         wnd.Show()
     }
 
-    static UpdateInfoGui() {
+    static UpdateInfoGui(infoWnd) {
         static RepeatStr(str, count) => StrReplace(Format('{:' . count . '}', ''), ' ', str)
         static counter := 0
         if !this.ready {
-            this.infoGui.txt.Text := this.infoText . RepeatStr('.', Mod(counter++, 4))
+            infoWnd.txt.Text := this.infoText . RepeatStr('.', Mod(counter++, 4))
         } else {
             SetTimer , 0
-            this.infoGui.txt.Text := 'Ready!'
+            infoWnd.txt.Text := 'Ready!'
             Sleep 500
-            this.infoGui.Destroy()
+            infoWnd.Destroy()
             this.BlockTrayMenu(false)
         }
     }
@@ -1928,6 +2072,10 @@ class TranslateWindow
 {
     static guis := LinkedOrderedMap(), lastGui := ''
          , MIN_EDIT_HEIGHT := 60, MAX_AUTO_EDIT_HEIGHT := 350
+         , ROMAN_GAP := 5   ; above a romanization strip; the buttons are 5 below it too
+         , BUTTON_FRAME_INSET := 1   ; pixels between the rectangle of a themed button and its frame
+         , WS_EX_COMPOSITED := 0x02000000, WS_CLIPCHILDREN := 0x02000000   ; SetLiveLayout
+         , romanizer := (text, sl) => GoogleTranslator.Romanize(text, sl)   ; replaced by the tests
          ; Dragging the edge between the fields (FieldSplitter); false turns it off.
          , FIELD_SPLITTER := true
          , resizeParams := {wnd: ''}
@@ -1982,16 +2130,24 @@ class TranslateWindow
         }
         this.lastSl := sl
         SetTimer wnd.waitTimer, tTxt == '' ? 300 : 0
+        this.ClearRomanization(wnd)
         if tTxt != '' {
+            ; Whether a field gets a strip is known from its text, before the
+            ; romanization comes: the window is resized once, with the
+            ; translation.
             if GoogleTranslator.rememberSize {
                 ; AdjustGuiSize is what shows the window otherwise: without it
                 ; a minimized window would stay minimized.
                 if WinGetMinMax(wnd.Hwnd) == -1 {
                     WinRestore(wnd.Hwnd)
                 }
+                this.ShowRomanStripsFor(wnd, tTxt, true)
                 wnd.Show()
             } else {
-                this.AdjustGuiSize(wnd, tTxt)
+                if WinGetMinMax(wnd.Hwnd) == -1 {
+                    WinRestore(wnd.Hwnd)
+                }
+                this.AdjustGuiSize(wnd, tTxt, this.ShowRomanStripsFor(wnd, tTxt, false))
             }
         }
         return wnd
@@ -2026,11 +2182,14 @@ class TranslateWindow
         }
         savedSize := GoogleTranslator.rememberSize ? this.GetSavedSize() : ''
         wnd := this.CreateGui(sl, tl, sTxt, tTxt, savedSize)
+        ; Shown, the window gives the first language list the focus for a
+        ; moment; its Focus event may run before AddGui moves the focus away.
+        wnd.opening := true
         wnd.edge := 'right'
         this.StoreHorizontalCoords(wnd)
         ; A window of the saved width is first shown hidden at its natural
         ; width: the layout and the minimum size are counted from that.
-        showOptions := savedSize ? ' Hide' : ''
+        showOptions := (savedSize ? ' Hide' : '') . ' h' . wnd.layoutClientH
         if this.lastGui {
             if this.GetNormalWindowPosition(this.lastGui.hwnd, &x, &y) {
                 wnd.Show('x' . (x + 30) . ' y' . (y + 30) . showOptions)
@@ -2081,6 +2240,9 @@ class TranslateWindow
             guiH -= Max(0, editH - this.MIN_EDIT_HEIGHT)
         }
         wnd.Opt('+MinSize' . guiW . 'x' . guiH)
+        ; The minimum grows by the romanization strips shown (SetRomanStrips).
+        wnd.minW := guiW
+        wnd.baseMinH := guiH
         if savedSize {
             width := Max(savedSize.width, guiW)
             ; Laid out before it is shown, the window does not flash at its
@@ -2089,6 +2251,7 @@ class TranslateWindow
             wnd.Show('w' . width)
             this.KeepInWorkArea(wnd.Hwnd)
         }
+        wnd.opening := false
         return wnd
     }
 
@@ -2223,6 +2386,7 @@ class TranslateWindow
                     ; before the positions are taken as the base of this drag.
                     this.LayoutToClientSize(wnd)
                     this.StoreVerticalCoords(wnd)
+                    this.SetLiveLayout(wnd, true)
                 case EVENT_SYSTEM_MOVESIZEEND:
                     ; Size events of a drag may be lost (see OnGuiSize), the
                     ; last one included, so lay out by the final size.
@@ -2234,6 +2398,7 @@ class TranslateWindow
     static FinishResize(wnd) {
         if this.IsAlive(wnd) {
             this.LayoutToClientSize(wnd)
+            this.SetLiveLayout(wnd, false)
             this.SaveWindowSize(wnd)
         }
     }
@@ -2254,7 +2419,26 @@ class TranslateWindow
     }
 
     static WM_KEYDOWN(wp, lp, msg, hwnd) {
-        static VK_ENTER := 0x000D
+        static VK_TAB := 0x09, VK_ENTER := 0x000D, VK_CONTROL := 0x11, GA_ROOT := 2
+        if wp == VK_TAB {
+            ; The key state as of this message, not the current one.
+            if !(DllCall('GetKeyState', 'Int', VK_CONTROL, 'Short') & 0x8000) {
+                return
+            }
+            ; The focus may be in the edit field of a combo box, which is not
+            ; a GUI control itself.
+            rootHwnd := DllCall('GetAncestor', 'Ptr', hwnd, 'UInt', GA_ROOT, 'Ptr')
+            if !this.guis.Has(rootHwnd) {
+                return
+            }
+            ; Bit 30 marks the auto-repeat of a held key: the languages would
+            ; swap back and forth.
+            if !(lp & (1 << 30)) {
+                this.SwapLanguages(this.guis[rootHwnd])
+            }
+            ; Ctrl+Tab would insert a tab character into a multi-line field.
+            return 0
+        }
         if wp != VK_ENTER {
             return
         }
@@ -2271,12 +2455,14 @@ class TranslateWindow
         }
         ; Shift+Enter inserts a line break: the edits have no WantReturn, so
         ; a plain Enter would reach the default button instead.
-        if ctrl.Type == 'Edit' && GetKeyState('Shift') {
+        isRomanField := wnd.HasOwnProp('roman1') && (ctrl == wnd.roman1 || ctrl == wnd.roman2)
+        if ctrl.Type == 'Edit' && !isRomanField && GetKeyState('Shift') {
             EditPaste('`r`n', ctrl)
             return 0
         }
-        ; Enter in the bottom field acts like its own reverse-translation button.
-        this.TranslateFromGui(wnd, ctrl == wnd.edit2 ? 'backward' : 'forward')
+        ; Enter in the bottom field (or in its romanization) acts like its own
+        ; reverse-translation button.
+        this.TranslateFromGui(wnd, ctrl == wnd.edit2 || (isRomanField && ctrl == wnd.roman2) ? 'backward' : 'forward')
         return 0
     }
 
@@ -2370,16 +2556,10 @@ class TranslateWindow
             wnd.txt%i% := wnd.AddText('xm y+15 Right w' . txtWidth, lang . ':')                                                 ; <————————————— Text 'Source Language', 'Target Language'
             lang := ['sl', 'tl'][i]
             wnd.lng%i% := wnd.AddComboBox('x+5 yp-2 w182 Choose' . this.LangIndex(lang, i == 1 ? sl : tl), this.%lang%Arr)      ; <————————————— ComboBoxes with language selection
+            wnd.lng%i%.OnEvent('Focus', ObjBindMethod(this, 'SwitchLayoutForLanguageList', wnd))
             
             wnd.swapLang%i% := wnd.AddButton('x+5 yp-1 w23 h23 ' . BS_ICON)                                                     ; <————————————— Swap language buttons
-            wnd.swapLang%i%.OnEvent('Click', (*) => (
-                sourceLang := wnd.lng1.Text,
-                (this.LangNameToCode(sourceLang) != 'auto' && (
-                    targetLang := wnd.lng2.Text,
-                    wnd.lng1.Text := targetLang,
-                    wnd.lng2.Text := sourceLang
-                ))
-            ))
+            wnd.swapLang%i%.OnEvent('Click', ObjBindMethod(this, 'SwapLanguages', wnd))
             this.SetButtonIcon(wnd.swapLang%i%, 'swap')
             (i == 1 && wnd.swapLang1.GetPos(&xSwap))
             txt := i == 1 ? sTxt : tTxt
@@ -2400,6 +2580,7 @@ class TranslateWindow
                     ? (wnd.play%i%.Enabled := true)
                     : (!AudioChannel.channels.Has(wnd.play%i%.hwnd) && wnd.play%i%.Enabled := false)
             )).Bind(i))
+            wnd.edit%i%.OnEvent('Focus', ObjBindMethod(this, 'SwitchLayoutForField', wnd, i))
             wnd.SetFont('s8', 'Verdana')
             wnd.play%i% := wnd.AddButton('xm y+5 w52 h23 ' . BS_ICON . (txt == '' ? ' Disabled' : ''))                          ; <————————————— Play-Pause button
             this.SetButtonIcon(wnd.play%i%, 'play', 12)
@@ -2412,11 +2593,116 @@ class TranslateWindow
             this.SetButtonIcon(wnd.trans%i%, i == 1 ? 'translate' : 'backward', i == 1 ? 16 : 15)
             wnd.trans%i%.OnEvent('Click', ObjBindMethod(this, 'TranslateFromGui', wnd, i == 1 ? 'forward' : 'backward'))
         }
+        ; The romanization of each field's text, in a strip of two lines under
+        ; it: read-only and borderless, so it can be selected and copied apart
+        ; from the text. A longer text scrolls, and the tooltip shows all of
+        ; it. The strips are created last, hidden and one pixel high: the
+        ; window is sized without them, and the controls placed with "y+"
+        ; follow the buttons. SetRomanStrips shows them where needed.
+        wnd.SetFont('s10', 'Calibri')
+        Loop 2 {
+            i := A_Index
+            wnd.edit%i%.GetPos(&editX, &editY, &editW, &editH)
+            wnd.roman%i% := wnd.AddEdit('x' . editX . ' y' . (editY + editH + this.ROMAN_GAP) . ' w' . editW
+                                      . ' h1 Hidden Multi ReadOnly -Tabstop -VScroll -E0x200')
+            ; First: the callback enabling the play button returns a value,
+            ; which stops the callbacks after it.
+            wnd.edit%i%.OnEvent('Change', ObjBindMethod(this, 'OnFieldChange', wnd, i), -1)
+        }
+        wnd.romanVisible := [false, false]
+        wnd.romanFieldGive := [0, 0]   ; what each field gave to its strip
+        wnd.romanSource := ['', '']   ; the texts the romanization in the strips is for
+        wnd.romanStripH := this.RomanStripHeight()
         (GoogleTranslator.darkTheme && DarkTheme.SetWindowTheme(wnd))
+        ; Above 100% the swap button gets lower (AlignLanguageRow), and the
+        ; gap under the language row would grow by as much: the controls
+        ; below the row move up by it. AHK sizes the window by where the
+        ; controls were created, so the height it needs is kept for Show.
+        static belowRow := [['edit1', 'play1', 'stop1', 'trans1', 'roman1',
+                             'txt2', 'lng2', 'swapLang2', 'edit2', 'play2', 'stop2', 'trans2', 'roman2'],
+                            ['edit2', 'play2', 'stop2', 'trans2', 'roman2']]
+        Loop 2 {
+            i := A_Index
+            rowBottom := this.ClientRect(wnd.swapLang%i%).bottom
+            this.AlignLanguageRow(wnd, i)
+            shift := this.ClientRect(wnd.swapLang%i%).bottom - rowBottom
+            if shift {
+                for ctrlName in belowRow[i] {
+                    this.MoveControlBy(wnd.%ctrlName%, shift)
+                }
+            }
+        }
+        wnd.layoutClientH := Round(this.ClientRect(wnd.trans2).bottom * 96 / A_ScreenDPI) + wnd.MarginY
         return wnd
     }
 
-    static AdjustGuiSize(wnd, txt) {
+    ; Moves a control vertically by pixels, keeping its size.
+    static MoveControlBy(ctrl, shift) {
+        static SWP_NOSIZE := 0x1, SWP_NOZORDER := 0x4, SWP_NOACTIVATE := 0x10
+        ctrlRect := this.ClientRect(ctrl)
+        DllCall('SetWindowPos', 'Ptr', ctrl.Hwnd, 'Ptr', 0, 'Int', ctrlRect.left, 'Int', ctrlRect.top + shift,
+                'Int', 0, 'Int', 0, 'UInt', SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
+    }
+
+    ; The height of a combo box follows its font, the height of a button is
+    ; scaled with the screen: above 100% the language list is lower than the
+    ; swap button next to it. The list keeps its own height, with its text
+    ; in the middle; the button gets the height and the top of the list.
+    ; (Making the list higher does not work: its edit field fills it and
+    ; draws the text at its top, and a lowered edit field leaves stripes the
+    ; list does not paint.) A themed push button draws its frame
+    ; BUTTON_FRAME_INSET pixels inside its rectangle (measured at 100% and
+    ; 200%), so the rectangle is that much larger on each side. Everything
+    ; is in pixels: in DPI-scaled units a pixel is half a unit at 200%, and
+    ; the button would be a pixel off. The label, in the font of the list,
+    ; is put level with the text of the list. Called again whenever the row
+    ; may have moved.
+    static AlignLanguageRow(wnd, i) {
+        static CB_GETCOMBOBOXINFO := 0x164, SWP_NOSIZE := 0x1, SWP_NOZORDER := 0x4, SWP_NOACTIVATE := 0x10
+        if !wnd.HasOwnProp('swapLang' . i) {
+            return
+        }
+        combo := wnd.lng%i%, button := wnd.swapLang%i%
+        comboRect := this.ClientRect(combo)
+        buttonRect := this.ClientRect(button)
+        targetTop := comboRect.top - this.BUTTON_FRAME_INSET
+        targetH := comboRect.bottom - comboRect.top + 2 * this.BUTTON_FRAME_INSET
+        if buttonRect.top != targetTop || buttonRect.bottom - buttonRect.top != targetH {
+            DllCall('SetWindowPos', 'Ptr', button.Hwnd, 'Ptr', 0, 'Int', buttonRect.left, 'Int', targetTop,
+                    'Int', buttonRect.right - buttonRect.left, 'Int', targetH, 'UInt', SWP_NOZORDER | SWP_NOACTIVATE)
+        }
+        comboInfo := Buffer(40 + A_PtrSize * 3, 0)   ; COMBOBOXINFO
+        NumPut('UInt', comboInfo.Size, comboInfo)
+        if !SendMessage(CB_GETCOMBOBOXINFO, 0, comboInfo, combo) {
+            return
+        }
+        editHwnd := NumGet(comboInfo, 40 + A_PtrSize, 'Ptr')   ; hwndItem
+        if !editHwnd {
+            return
+        }
+        editRect := Buffer(16)
+        DllCall('GetWindowRect', 'Ptr', editHwnd, 'Ptr', editRect)
+        DllCall('MapWindowPoints', 'Ptr', 0, 'Ptr', wnd.Hwnd, 'Ptr', editRect, 'UInt', 2)
+        labelRect := this.ClientRect(wnd.txt%i%)
+        labelTop := NumGet(editRect, 4, 'Int')
+        if labelRect.top != labelTop {
+            DllCall('SetWindowPos', 'Ptr', wnd.txt%i%.Hwnd, 'Ptr', 0, 'Int', labelRect.left, 'Int', labelTop,
+                    'Int', 0, 'Int', 0, 'UInt', SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
+        }
+    }
+
+    ; The rectangle of a control in the client coordinates of its window, in pixels.
+    static ClientRect(ctrl) {
+        rect := Buffer(16)
+        DllCall('GetWindowRect', 'Ptr', ctrl.Hwnd, 'Ptr', rect)
+        DllCall('MapWindowPoints', 'Ptr', 0, 'Ptr', ctrl.Gui.Hwnd, 'Ptr', rect, 'UInt', 2)
+        return {left: NumGet(rect, 0, 'Int'), top: NumGet(rect, 4, 'Int'),
+                right: NumGet(rect, 8, 'Int'), bottom: NumGet(rect, 12, 'Int')}
+    }
+
+    ; extraHeight: what the window has already gained below the bottom field
+    ; (romanization strips shown without resizing the window).
+    static AdjustGuiSize(wnd, txt, extraHeight := 0) {
         ; The client area of a minimized window is empty, and a height counted
         ; from it is cut to the minimum size. Show below restores the window
         ; anyway, so restore it first and count from its real height.
@@ -2427,7 +2713,7 @@ class TranslateWindow
         wnd.GetClientPos(,, &guiW, &guiH)
         newEditH := this.GetTextHeight(this.fontSize[2], 'Calibri', editW, txt) + 15
         newEditH := Max(this.MIN_EDIT_HEIGHT, Min(newEditH, this.MAX_AUTO_EDIT_HEIGHT))
-        newHeight := guiH + newEditH - editH
+        newHeight := guiH + extraHeight + newEditH - editH
 
         wnd.edge := 'bottom'
         this.StoreVerticalCoords(wnd)
@@ -2472,6 +2758,10 @@ class TranslateWindow
             WinRedraw(wnd)
             this.SetSelToCB(wnd.lng1)
             this.SetSelToCB(wnd.lng2)
+            ; A new theme may give the lists their own height back.
+            Loop 2 {
+                this.AlignLanguageRow(wnd, A_Index)
+            }
             active := WinActive(wnd)
             SendMessage(WM_NCACTIVATE, !active,,, wnd)
             SendMessage(WM_NCACTIVATE,  active,,, wnd)
@@ -2531,6 +2821,242 @@ class TranslateWindow
             wnd.lng2.Text := txt2
         }
         GoogleTranslator.Translate(text, tl, sl, wnd)
+    }
+
+    ; Two lines of the romanization font.
+    static RomanStripHeight() => this.GetTextSize(10, 'Calibri', 'Ag`nAg')[2] + 2
+
+    ; The controls of both halves of the window, the romanization strips
+    ; included when the window has them.
+    static LayoutControlNames(wnd) {
+        names := ['txt', 'lng', 'swapLang', 'edit', 'play', 'stop', 'trans']
+        (wnd.HasOwnProp('roman1') && names.Push('roman'))
+        return names
+    }
+
+    ; Which fields get a romanization strip: those with letters outside the
+    ; Latin script, while Show Romanization is on.
+    static RomanStripsWanted(sourceText, translation) {
+        available := GoogleTranslator.showRoman && !GoogleTranslator.IsRomanizationBlocked()
+        return [available && GoogleTranslator.NeedsRomanization(sourceText),
+                available && GoogleTranslator.NeedsRomanization(translation)]
+    }
+
+    ; Shows the strips the texts of a window need, with a placeholder, and
+    ; starts the requests. Returns what SetRomanStrips returns.
+    static ShowRomanStripsFor(wnd, translation, resizeWindow) {
+        if !wnd.HasOwnProp('roman1') {
+            return 0
+        }
+        wanted := this.RomanStripsWanted(wnd.edit1.Text, translation)
+        heightDelta := this.SetRomanStrips(wnd, wanted[1], wanted[2], resizeWindow)
+        wnd.romanSource := [wnd.edit1.Text, wnd.edit2.Text]
+        Loop 2 {
+            (wanted[A_Index] && wnd.roman%A_Index%.Value := '…')
+        }
+        if wanted[1] || wanted[2] {
+            SetTimer(ObjBindMethod(this, 'FillRomanization', wnd), -1)
+        }
+        return heightDelta
+    }
+
+    ; Shows or hides the romanization strips. Without Remember Window Size
+    ; the window grows or shrinks by a strip. With it, the field above the
+    ; strip gives its place, the window growing only by what the field cannot
+    ; give above its minimum; a hidden strip gives back to the field and the
+    ; window what they gave (romanFieldGive), so the size comes back. With
+    ; resizeWindow false the window is not resized, and the caller adds the
+    ; returned height change to the new height of the window (AdjustGuiSize).
+    ;
+    ; GUI Size events run as new threads: a resize may still be waiting to
+    ; be laid out when the strips change (a request that fails at once comes
+    ; before it). The layout is brought to the window size first and stored
+    ; after the change: a late Size event must not undo the strips. Nor may
+    ; one run in the middle of the change: moving the controls lets waiting
+    ; events in, and a Size event laid the half moved window out from the
+    ; positions stored before (seen in the regression, once in a few runs).
+    ; So the change is not interrupted.
+    static SetRomanStrips(wnd, visible1, visible2, resizeWindow := true) {
+        if !wnd.HasOwnProp('roman1') {
+            return 0
+        }
+        visible := [visible1, visible2]
+        if visible[1] == wnd.romanVisible[1] && visible[2] == wnd.romanVisible[2] {
+            return 0
+        }
+        wasCritical := A_IsCritical
+        Critical
+        try {
+            return this._SetRomanStrips(wnd, visible, resizeWindow)
+        } finally {
+            Critical wasCritical
+        }
+    }
+
+    static _SetRomanStrips(wnd, visible, resizeWindow) {
+        this.LayoutToClientSize(wnd)
+        stripH := wnd.romanStripH
+        extra := stripH + this.ROMAN_GAP
+        shift := 0   ; how far the controls below the strip being changed move
+        Loop 2 {
+            i := A_Index
+            wnd.edit%i%.GetPos(, &editY,, &editH)
+            editY += shift
+            newEditH := editH
+            if visible[i] && !wnd.romanVisible[i] {
+                fieldGive := GoogleTranslator.rememberSize
+                    ? Max(0, Min(extra, editH - this.MIN_EDIT_HEIGHT)) : 0
+                wnd.romanFieldGive[i] := fieldGive
+                newEditH := editH - fieldGive
+            } else if !visible[i] && wnd.romanVisible[i] {
+                newEditH := editH + wnd.romanFieldGive[i]
+                wnd.romanFieldGive[i] := 0
+            }
+            shift += newEditH - editH + (visible[i] - wnd.romanVisible[i]) * extra
+            this.PlaceControl(wnd.edit%i%, editY, newEditH)
+            if visible[i] {
+                wnd.roman%i%.Move(, editY + newEditH + this.ROMAN_GAP,, stripH)
+            }
+            wnd.roman%i%.Visible := visible[i]
+            wnd.romanVisible[i] := visible[i]
+            ; The controls below the field, down to the next field (which is
+            ; moved at the start of its own pass): the second half moves by
+            ; the change of the first strip, the bottom buttons by both.
+            for ctrl in (i == 1 ? ['play1', 'stop1', 'trans1', 'txt2', 'lng2', 'swapLang2']
+                                : ['play2', 'stop2', 'trans2']) {
+                wnd.%ctrl%.GetPos(, &ctrlY)
+                this.PlaceControl(wnd.%ctrl%, ctrlY + shift)
+            }
+        }
+        this.AlignLanguageRow(wnd, 2)
+        shownExtra := (visible[1] + visible[2]) * extra
+        wnd.Opt('+MinSize' . wnd.minW . 'x' . (wnd.baseMinH + shownExtra))
+        ; The controls are in place: stored as the base of the layout, a resize
+        ; to the new height changes nothing in it.
+        wnd.edge := 'bottom'
+        this.StoreVerticalCoords(wnd)
+        if resizeWindow && shift {
+            wnd.GetClientPos(,,, &clientH)
+            wnd.Show('NA h' . (clientH + shift))
+            this.ShedulePosCorrection(wnd)
+        }
+        return shift
+    }
+
+    static FillRomanization(wnd) {
+        Loop 2 {
+            i := A_Index
+            if !this.IsAlive(wnd) || !GoogleTranslator.showRoman {
+                return
+            }
+            if !wnd.romanVisible[i] {
+                continue
+            }
+            fieldText := wnd.edit%i%.Text
+            roman := (this.romanizer)(fieldText, this.LangNameToCode(wnd.lng%i%.Text))
+            ; A new translation or the user's typing may have replaced the
+            ; text while the request was running.
+            if !this.IsAlive(wnd) || wnd.edit%i%.Text != fieldText || !wnd.romanVisible[i] {
+                continue
+            }
+            if roman != '' {
+                this.SetRomanization(wnd, i, roman)
+            } else {
+                ; The request failed: an empty strip is not left in the window.
+                this.SetRomanStrips(wnd, i == 1 ? false : wnd.romanVisible[1], i == 2 ? false : wnd.romanVisible[2])
+            }
+        }
+    }
+
+    static SetRomanization(wnd, i, roman) {
+        roman := StrReplace(StrReplace(StrReplace(roman, '`r`n', '`n'), '`r', '`n'), '`n', '`r`n')
+        wnd.roman%i%.Value := roman
+        try wnd.buttonHints.SetText(wnd.roman%i%, roman)
+    }
+
+    ; The Change event comes for the text the program puts into a field too,
+    ; after the placeholder or the romanization is already shown: only
+    ; another text clears it.
+    static OnFieldChange(wnd, i, *) {
+        if wnd.edit%i%.Text != wnd.romanSource[i] {
+            this.ClearRomanization(wnd, i)
+        }
+    }
+
+    ; Clears the romanization of a field, or of both. The strip stays: it
+    ; changes with the next translation, not while the user is typing.
+    static ClearRomanization(wnd, i := 0, *) {
+        if !wnd.HasOwnProp('roman1') {
+            return
+        }
+        for fieldNum in (i ? [i] : [1, 2]) {
+            if wnd.roman%fieldNum%.Value != '' {
+                wnd.roman%fieldNum%.Value := ''
+                try wnd.buttonHints.SetText(wnd.roman%fieldNum%, '')
+            }
+        }
+    }
+
+    ; Show Romanization turned on or off: the open windows follow at once.
+    static OnRomanizationToggled() {
+        for hwnd, wnd in this.guis {
+            if !wnd.HasOwnProp('roman1') {
+                continue
+            }
+            this.ClearRomanization(wnd)
+            if GoogleTranslator.showRoman && wnd.edit2.Text != '' {
+                this.ShowRomanStripsFor(wnd, wnd.edit2.Text, true)
+            } else {
+                this.SetRomanStrips(wnd, false, false)
+            }
+        }
+    }
+
+    ; Swaps the source and target languages of a window (the swap buttons and
+    ; Ctrl+Tab). An automatically detected source language has nothing to swap
+    ; with: a notice under the swap button says so.
+    static SwapLanguages(wnd, anchorCtrl := '', *) {
+        sourceLang := wnd.lng1.Text
+        if this.LangNameToCode(sourceLang) == 'auto' {
+            if wnd.HasOwnProp('buttonHints') {
+                wnd.buttonHints.ShowNotice(anchorCtrl is Gui.Control ? anchorCtrl : wnd.swapLang1,
+                                           GoogleTranslator.InterfaceTextOrSource('swapAutoNoticeText'))
+            }
+            return
+        }
+        targetLang := wnd.lng2.Text
+        wnd.lng1.Text := targetLang
+        wnd.lng2.Text := sourceLang
+        ; Ctrl+Tab in a field: the field now has the other language.
+        focusedCtrl := wnd.FocusedCtrl
+        for i in [1, 2] {
+            if focusedCtrl == wnd.edit%i% {
+                this.SwitchLayoutForField(wnd, i)
+            }
+        }
+    }
+
+    ; The language names in the lists are in the native language: typing one
+    ; to find it needs the native layout.
+    static SwitchLayoutForLanguageList(wnd, ctrl, *) {
+        if GoogleTranslator.switchLayout && !wnd.opening && this.HasFocus(ctrl) {
+            KeyboardLayoutSwitcher.OnFieldFocus(GoogleTranslator.nativeLanguage)
+        }
+    }
+
+    ; GUI events run as new threads, after the focus may have moved on: a new
+    ; window gives the first language list the focus when it is shown, and
+    ; then moves it away. Only a control that still has the focus switches.
+    static HasFocus(ctrl) {
+        focusHwnd := DllCall('GetFocus', 'Ptr')
+        return focusHwnd && (focusHwnd == ctrl.Hwnd || DllCall('IsChild', 'Ptr', ctrl.Hwnd, 'Ptr', focusHwnd, 'Int'))
+    }
+
+    ; The keyboard layout follows the language of the field with the focus.
+    static SwitchLayoutForField(wnd, i, *) {
+        if GoogleTranslator.switchLayout && this.HasFocus(wnd.edit%i%) {
+            KeyboardLayoutSwitcher.OnFieldFocus(this.LangNameToCode(wnd.lng%i%.Text))
+        }
     }
 
     static LangNameToCode(lngName) {
@@ -2751,12 +3277,22 @@ class TranslateWindow
         if !wnd.HasOwnProp('edge') || !wnd.HasOwnProp('coords') || minMax == -1 {
             return
         }
-        SetWinDelay 0
-        SetControlDelay 0
-        wnd.GetClientPos(,, &width, &height)
-        this.ResizeHorizontal(wnd, width)
-        this.ResizeVertical(wnd, height)
-        this.ShedulePosCorrection(wnd)
+        ; Laid out from the stored positions, the window must not be changed
+        ; by another thread halfway (see SetRomanStrips). Restored: the tests
+        ; call this from their own thread.
+        wasCritical := A_IsCritical
+        Critical
+        try {
+            SetWinDelay 0
+            SetControlDelay 0
+            wnd.GetClientPos(,, &width, &height)
+            this.ResizeHorizontal(wnd, width)
+            this.ResizeVertical(wnd, height)
+            this.RepaintBackground(wnd)
+            this.ShedulePosCorrection(wnd)
+        } finally {
+            Critical wasCritical
+        }
     }
 
     static ResizeHorizontal(wnd, width) {
@@ -2769,6 +3305,7 @@ class TranslateWindow
                 }
                 wnd.edit%i%.Move(,, width - wnd.MarginX * 2)
                 wnd.trans%i%.Move(width - wnd.MarginX - wnd.coords['trans' . i].w + 1)
+                (wnd.HasOwnProp('roman1') && wnd.roman%i%.Move(,, width - wnd.MarginX * 2))
             }
         }
     }
@@ -2811,13 +3348,17 @@ class TranslateWindow
         bottomShift := middleShift + edit2H - coords['edit2'].h
 
         this.PlaceControl(wnd.edit1, coords['edit1'].y, edit1H)
-        for ctrl in ['txt2', 'lng2', 'swapLang2', 'play1', 'stop1', 'trans1'] {
+        hasRoman := wnd.HasOwnProp('roman1')
+        for ctrl in (hasRoman ? ['txt2', 'lng2', 'swapLang2', 'roman1', 'play1', 'stop1', 'trans1']
+                              : ['txt2', 'lng2', 'swapLang2', 'play1', 'stop1', 'trans1']) {
             this.PlaceControl(wnd.%ctrl%, coords[ctrl].y + middleShift)
         }
         this.PlaceControl(wnd.edit2, coords['edit2'].y + middleShift, edit2H)
-        for ctrl in ['play2', 'stop2', 'trans2'] {
+        for ctrl in (hasRoman ? ['roman2', 'play2', 'stop2', 'trans2'] : ['play2', 'stop2', 'trans2']) {
             this.PlaceControl(wnd.%ctrl%, coords[ctrl].y + bottomShift)
         }
+        ; Moved in DPI-scaled units, the lower list may be a pixel off its button.
+        this.AlignLanguageRow(wnd, 2)
     }
 
     ; Moves the edge between the fields by delta, keeping the window height:
@@ -2826,7 +3367,65 @@ class TranslateWindow
         edit1H := wnd.coords['edit1'].h
         edit2H := wnd.coords['edit2'].h
         delta := Max(this.MIN_EDIT_HEIGHT - edit1H, Min(delta, edit2H - this.MIN_EDIT_HEIGHT))
-        this.PlaceFields(wnd, edit1H + delta, edit2H - delta)
+        ; Each control moved alone repaints at once, and the window is seen
+        ; half laid out on every mouse move. A resize by the window border
+        ; does not flicker: Windows paints it once. So does this.
+        ; The language row above the top field does not move: it is not
+        ; repainted, or it flickers with the rest.
+        this.WithRedrawFrozen(wnd, () => this.PlaceFields(wnd, edit1H + delta, edit2H - delta), wnd.edit1)
+    }
+
+    ; While the window is laid out live (the edge between the fields or the
+    ; border of the window is dragged), it is double-buffered
+    ; (WS_EX_COMPOSITED), so the controls moved one by one are shown
+    ; together, and it does not paint its background under its controls
+    ; (WS_CLIPCHILDREN), so a moved control does not flash in the window
+    ; color first. Without WS_CLIPCHILDREN nothing is left behind, though:
+    ; with it what a resize or a moved control left between the controls
+    ; stays (smears at the bottom on a resize by the top border), so that
+    ; background is repainted after every layout pass (RepaintBackground).
+    ; Only for the drag: with WS_EX_COMPOSITED the window repaints whole for
+    ; the blinking caret of a field.
+    static SetLiveLayout(wnd, live) {
+        static RDW_INVALIDATE := 0x1, RDW_ERASE := 0x4, RDW_ALLCHILDREN := 0x80
+        try {
+            WinSetExStyle((live ? '+' : '-') . this.WS_EX_COMPOSITED, wnd.Hwnd)
+            WinSetStyle((live ? '+' : '-') . this.WS_CLIPCHILDREN, wnd.Hwnd)
+            if !live {
+                DllCall('RedrawWindow', 'Ptr', wnd.Hwnd, 'Ptr', 0, 'Ptr', 0,
+                        'UInt', RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN)
+            }
+        }
+    }
+
+    static RepaintBackground(wnd) {
+        static RDW_INVALIDATE := 0x1, RDW_ERASE := 0x4, RDW_NOCHILDREN := 0x40
+        if WinGetStyle(wnd.Hwnd) & this.WS_CLIPCHILDREN {
+            DllCall('RedrawWindow', 'Ptr', wnd.Hwnd, 'Ptr', 0, 'Ptr', 0,
+                    'UInt', RDW_INVALIDATE | RDW_ERASE | RDW_NOCHILDREN)
+        }
+    }
+
+    ; Runs action with the painting of the window turned off, then repaints
+    ; the window with its controls in one pass: all of it, or from the top of
+    ; fromCtrl down.
+    static WithRedrawFrozen(wnd, action, fromCtrl := '') {
+        static WM_SETREDRAW := 0xB
+             , RDW_INVALIDATE := 0x1, RDW_ERASE := 0x4, RDW_ALLCHILDREN := 0x80, RDW_UPDATENOW := 0x100
+        DllCall('SendMessage', 'Ptr', wnd.Hwnd, 'UInt', WM_SETREDRAW, 'Ptr', false, 'Ptr', 0)
+        try {
+            action()
+        } finally {
+            DllCall('SendMessage', 'Ptr', wnd.Hwnd, 'UInt', WM_SETREDRAW, 'Ptr', true, 'Ptr', 0)
+            updateRect := 0
+            if fromCtrl {
+                updateRect := Buffer(16)
+                DllCall('GetClientRect', 'Ptr', wnd.Hwnd, 'Ptr', updateRect)
+                NumPut('Int', this.ClientRect(fromCtrl).top, updateRect, 4)
+            }
+            DllCall('RedrawWindow', 'Ptr', wnd.Hwnd, 'Ptr', updateRect, 'Ptr', 0,
+                    'UInt', RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW)
+        }
     }
 
     ; Moves and redraws a control only when its place changes: redrawing
@@ -2853,10 +3452,18 @@ class TranslateWindow
         try {
             params.wnd.GetClientPos(,,, &height)
             params.wnd.edit2.GetPos(, &y)
-            params.wnd.edit2.Move(,,, height - y - 37)
+            ; The strip under the bottom field takes its height and a gap.
+            stripH := 0
+            if params.wnd.HasOwnProp('roman2') && params.wnd.romanVisible[2] {
+                params.wnd.roman2.GetPos(,,, &stripH)
+                params.wnd.roman2.Move(, height - 32 - this.ROMAN_GAP - stripH)
+                stripH += this.ROMAN_GAP
+            }
+            params.wnd.edit2.Move(,,, height - y - 37 - stripH)
             for ctrl in ['play2', 'stop2', 'trans2'] {
                 params.wnd.%ctrl%.Move(, height - 32)
             }
+            this.RepaintBackground(params.wnd)
         }
     }
 
@@ -2864,7 +3471,7 @@ class TranslateWindow
         wnd.coords := Map()
         Loop 2 {
             i := A_Index
-            for ctrl in ['txt', 'lng', 'swapLang', 'edit', 'play', 'stop', 'trans'] {
+            for ctrl in this.LayoutControlNames(wnd) {
                 wnd.%ctrl . i%.GetPos(&x,, &w)
                 wnd.coords[ctrl . i] := {x: x, w: w}
             }
@@ -2876,7 +3483,7 @@ class TranslateWindow
     static StoreVerticalCoords(wnd) {
         Loop 2 {
             i := A_Index
-            for ctrl in ['txt', 'lng', 'swapLang', 'edit', 'play', 'stop', 'trans'] {
+            for ctrl in this.LayoutControlNames(wnd) {
                 wnd.%ctrl . i%.GetPos(, &y,, &h)
                 wnd.coords[ctrl . i].y := y
                 wnd.coords[ctrl . i].h := h
@@ -4623,6 +5230,7 @@ class CyclicDB
 class TranslationCache {
     static TYPE_TRANSLATION := 'T'
          , TYPE_AUDIO       := 'A'
+         , TYPE_ROMAN       := 'R'   ; the romanization of a text (Show Romanization)
          , DEFAULT_MAX_SIZE := 100 * 1024 * 1024  ; 100 MB
 
     db := ''
@@ -4756,6 +5364,33 @@ class TranslationCache {
         return true
     }
     
+    ; The romanization of a text, or an empty string. Only a found
+    ; romanization is stored: "none" is not, so it is asked for again.
+    GetRoman(text, sl) {
+        key := this._MakeRomanKey(text, sl)
+        data := this.db.Get(key, &found := false)
+        if !found {
+            this._DeleteInvalidRecord(key)
+            return ''
+        }
+        roman := data is Buffer ? StrGet(data, data.Size, 'UTF-8') : String(data)
+        if roman == '' {
+            this._DeleteInvalidRecord(key)
+        }
+        return roman
+    }
+
+    SetRoman(text, sl, roman) {
+        if roman == '' {
+            return false
+        }
+        try this.db.Set(this._MakeRomanKey(text, sl), this._StringToUTF8(roman))
+        catch {
+            return false
+        }
+        return true
+    }
+
     HasTranslation(text, sl, tl) {
         key := this._MakeTranslationKey(text, sl, tl)
         if this.lastTranslation && this.lastTranslation.key == key {
@@ -4775,8 +5410,10 @@ class TranslationCache {
     GetStats() {
         translationBytes := 0
         audioBytes := 0
+        romanBytes := 0
         translationCount := 0
         audioCount := 0
+        romanCount := 0
 
         for key, entry in this.db.index {
             recordSize := CyclicDB.RECORD_HEADER_SIZE + entry.keyLength + entry.dataLength
@@ -4787,17 +5424,22 @@ class TranslationCache {
             } else if entryType == TranslationCache.TYPE_AUDIO {
                 audioBytes += recordSize
                 audioCount++
+            } else if entryType == TranslationCache.TYPE_ROMAN {
+                romanBytes += recordSize
+                romanCount++
             }
         }
 
-        totalBytes := translationBytes + audioBytes
+        totalBytes := translationBytes + audioBytes + romanBytes
         capacityBytes := Max(0, this.db.maxSize - CyclicDB.HEADER_SIZE)
         return {
             recordCount: this.db.index.Count,
             translationCount: translationCount,
             audioCount: audioCount,
+            romanCount: romanCount,
             translationBytes: translationBytes,
             audioBytes: audioBytes,
+            romanBytes: romanBytes,
             totalBytes: totalBytes,
             maxSize: this.db.maxSize,
             usagePercent: capacityBytes ? Round(totalBytes / capacityBytes * 100, 2) : 0,
@@ -4837,6 +5479,11 @@ class TranslationCache {
     _MakeTranslationKey(text, sl, tl) {
         source := text . '|' . sl . '|' . tl
         return TranslationCache.TYPE_TRANSLATION . this._Hash(source)
+    }
+
+    _MakeRomanKey(text, sl) {
+        source := text . '|' . sl
+        return TranslationCache.TYPE_ROMAN . this._Hash(source)
     }
 
     _MakeAudioKey(text, lang) {
@@ -4881,6 +5528,8 @@ class DisabledTranslationCache
     SetTranslation(*) => false
     GetAudio(*) => ''
     SetAudio(*) => false
+    GetRoman(*) => ''
+    SetRoman(*) => false
     HasTranslation(*) => false
     HasAudio(*) => false
     Clear() => ''
@@ -5975,7 +6624,7 @@ RegisterSyncCallback(funcObj, options := '', paramCount?) {
 ; units of GetPos and Move.
 class FieldSplitter
 {
-    static dragWnd := '', dragStartY := 0, monitors := ''
+    static dragWnd := '', dragStartY := 0, lastDragY := '', monitors := ''
 
     static Install() {
         if IsObject(this.monitors) {
@@ -6021,7 +6670,8 @@ class FieldSplitter
     static HitTest(wnd, x, y) {
         topField := this.GetScreenRect(wnd.edit1)
         bottomField := this.GetScreenRect(wnd.edit2)
-        buttonsTop := this.GetScreenRect(wnd.play1).top
+        ; The edge ends where the strip of romanization or the buttons begin.
+        buttonsTop := this.GetScreenRect(wnd.HasOwnProp('roman1') && wnd.romanVisible[1] ? wnd.roman1 : wnd.play1).top
         languageRowBottom := Max(this.GetScreenRect(wnd.txt2).bottom,
                                  this.GetScreenRect(wnd.lng2).bottom,
                                  this.GetScreenRect(wnd.swapLang2).bottom)
@@ -6038,20 +6688,31 @@ class FieldSplitter
         return edit1H + edit2H > TranslateWindow.MIN_EDIT_HEIGHT * 2 + 1
     }
 
+    ; The window lays itself out live while the edge is dragged
+    ; (TranslateWindow.SetLiveLayout).
     static BeginDrag(wnd, startY) {
         TranslateWindow.StoreVerticalCoords(wnd)
         this.dragWnd := wnd
         this.dragStartY := startY
+        this.lastDragY := startY
+        TranslateWindow.SetLiveLayout(wnd, true)
         DllCall('SetCapture', 'Ptr', wnd.Hwnd)
         this.SetSizeCursor()
     }
 
+    ; Windows sends WM_MOUSEMOVE also when windows move under a still
+    ; pointer: laying out the fields again for it sends another one, and the
+    ; window kept repainting while the mouse stood. Only a new position counts.
     static DragTo(y) {
         wnd := this.dragWnd
         if !TranslateWindow.IsAlive(wnd) {
             this.EndDrag()
             return
         }
+        if y == this.lastDragY {
+            return
+        }
+        this.lastDragY := y
         TranslateWindow.SplitFields(wnd, Round((y - this.dragStartY) * 96 / A_ScreenDPI))
     }
 
@@ -6063,10 +6724,12 @@ class FieldSplitter
             return
         }
         this.dragWnd := ''
+        this.lastDragY := ''
         if DllCall('GetCapture', 'Ptr') == wnd.Hwnd {
             DllCall('ReleaseCapture')
         }
         if TranslateWindow.IsAlive(wnd) {
+            TranslateWindow.SetLiveLayout(wnd, false)
             TranslateWindow.StoreVerticalCoords(wnd)
             TranslateWindow.SaveWindowSize(wnd)
         }
@@ -6183,12 +6846,18 @@ class ButtonToolTips
 {
     static LIGHT_BACKGROUND := 0xFFFFFF, LIGHT_TEXT := 0x202020
          , AUTOPOP_MS := 3000   ; how long a tooltip stays while the pointer rests
+         , NOTICE_MS := 2500    ; how long a notice stays
+         , MAX_WIDTH := 450     ; of a tooltip at 96 DPI
+         , NOTICE_ID := 1       ; the tool of notices; button tools are identified by HWND
 
     __New(ownerWnd, darkMode := false) {
         static WS_EX_TOPMOST := 0x8, TTS_ALWAYSTIP := 0x1, TTS_NOPREFIX := 0x2
              , TTM_SETMARGIN := 0x41A, TTM_SETDELAYTIME := 0x403, TTDT_AUTOPOP := 2
+             , TTM_SETMAXTIPWIDTH := 0x418
         this.ownerHwnd := ownerWnd.Hwnd
         this.toolHwnds := Map()
+        this.noticeAdded := false
+        this.noticeSerial := 0
         ; TTS_ALWAYSTIP: the window is often inactive while it is used.
         this.hwnd := DllCall('CreateWindowEx', 'UInt', WS_EX_TOPMOST, 'Str', 'tooltips_class32',
                              'Ptr', 0, 'UInt', TTS_ALWAYSTIP | TTS_NOPREFIX,
@@ -6206,6 +6875,8 @@ class ButtonToolTips
                'Int', horizontalMargin, 'Int', verticalMargin, marginRect)
         SendMessage(TTM_SETMARGIN, 0, marginRect, this.hwnd)
         SendMessage(TTM_SETDELAYTIME, TTDT_AUTOPOP, ButtonToolTips.AUTOPOP_MS, this.hwnd)
+        ; A long text (the romanization of a field) wraps and keeps its line breaks.
+        SendMessage(TTM_SETMAXTIPWIDTH, 0, Round(ButtonToolTips.MAX_WIDTH * A_ScreenDPI / 96), this.hwnd)
         this.ApplyTheme(darkMode)
     }
 
@@ -6225,12 +6896,250 @@ class ButtonToolTips
         }
     }
 
+    ; Shows a message under a control for a while. It is a tracking tool of the
+    ; same tooltip control, so it has the colors of the window's tooltips and
+    ; is shown at once, wherever the mouse pointer is. Its right edge is under
+    ; the right edge of the control: the swap buttons are at the right side of
+    ; the window, so the notice extends over the window.
+    ShowNotice(anchorCtrl, noticeText, durationMs := ButtonToolTips.NOTICE_MS) {
+        static TTM_ADDTOOLW := 0x432, TTM_UPDATETIPTEXTW := 0x439
+             , TTM_TRACKPOSITION := 0x412, TTM_TRACKACTIVATE := 0x411
+             , MONITORINFO_SIZE := 40, MONITOR_DEFAULTTONEAREST := 2
+        toolInfo := this.NoticeToolInfo(noticeText)
+        if this.noticeAdded {
+            SendMessage(TTM_UPDATETIPTEXTW, 0, toolInfo, this.hwnd)
+        } else if SendMessage(TTM_ADDTOOLW, 0, toolInfo, this.hwnd) {
+            this.noticeAdded := true
+        } else {
+            return
+        }
+        ; The size of the bubble is known only once it is shown: it is shown
+        ; off screen first and then moved into place.
+        SendMessage(TTM_TRACKPOSITION, 0, (-32000 & 0xFFFF) << 16 | (-32000 & 0xFFFF), this.hwnd)
+        SendMessage(TTM_TRACKACTIVATE, true, toolInfo, this.hwnd)
+        bubbleRect := Buffer(16)
+        DllCall('GetWindowRect', 'Ptr', this.hwnd, 'Ptr', bubbleRect)
+        bubbleWidth := NumGet(bubbleRect, 8, 'Int') - NumGet(bubbleRect, 0, 'Int')
+        bubbleHeight := NumGet(bubbleRect, 12, 'Int') - NumGet(bubbleRect, 4, 'Int')
+        anchorRect := Buffer(16)
+        DllCall('GetWindowRect', 'Ptr', anchorCtrl.Hwnd, 'Ptr', anchorRect)
+        anchorTop := NumGet(anchorRect, 4, 'Int')
+        x := NumGet(anchorRect, 8, 'Int') - bubbleWidth
+        y := NumGet(anchorRect, 12, 'Int') + Round(2 * A_ScreenDPI / 96)
+        monitorHandle := DllCall('User32\MonitorFromWindow', 'Ptr', this.ownerHwnd,
+                                 'UInt', MONITOR_DEFAULTTONEAREST, 'Ptr')
+        monitorInfo := Buffer(MONITORINFO_SIZE, 0)
+        NumPut('UInt', MONITORINFO_SIZE, monitorInfo)
+        if monitorHandle && DllCall('User32\GetMonitorInfoW', 'Ptr', monitorHandle, 'Ptr', monitorInfo, 'Int') {
+            x := Max(NumGet(monitorInfo, 20, 'Int'), x)   ; work area left
+            ; Above the control when there is no room under it.
+            if y + bubbleHeight > NumGet(monitorInfo, 32, 'Int') {
+                y := anchorTop - bubbleHeight - Round(2 * A_ScreenDPI / 96)
+            }
+        }
+        SendMessage(TTM_TRACKPOSITION, 0, (y & 0xFFFF) << 16 | (x & 0xFFFF), this.hwnd)
+        ; A newer notice cancels the hiding of the previous one.
+        SetTimer(ObjBindMethod(this, 'HideNotice', ++this.noticeSerial), -durationMs)
+    }
+
+    HideNotice(serial := '') {
+        static TTM_TRACKACTIVATE := 0x411
+        if !this.noticeAdded || (serial != '' && serial != this.noticeSerial) {
+            return
+        }
+        ; The tooltip control is destroyed with its window.
+        if DllCall('IsWindow', 'Ptr', this.hwnd) {
+            SendMessage(TTM_TRACKACTIVATE, false, this.NoticeToolInfo(), this.hwnd)
+        }
+    }
+
+    NoticeToolInfo(noticeText := '') {
+        static TTF_TRACK := 0x20, TTF_ABSOLUTE := 0x80
+        toolInfo := Buffer(24 + A_PtrSize * 6, 0)   ; TTTOOLINFOW
+        NumPut('UInt', toolInfo.Size, 'UInt', TTF_TRACK | TTF_ABSOLUTE,
+               'Ptr', this.ownerHwnd, 'Ptr', ButtonToolTips.NOTICE_ID, toolInfo)
+        ; The control copies the text; the Buffer keeps it alive until then.
+        if noticeText != '' {
+            textBuffer := Buffer(StrPut(noticeText, 'UTF-16'))
+            StrPut(noticeText, textBuffer, 'UTF-16')
+            NumPut('Ptr', textBuffer.Ptr, toolInfo, 24 + A_PtrSize * 3)   ; lpszText
+            toolInfo.textBuffer := textBuffer
+        }
+        return toolInfo
+    }
+
     ApplyTheme(darkMode) {
         static TTM_SETTIPBKCOLOR := 0x413, TTM_SETTIPTEXTCOLOR := 0x414
         backColor := darkMode ? DarkTheme.DarkColors['Controls'] : ButtonToolTips.LIGHT_BACKGROUND
         textColor := darkMode ? DarkTheme.DarkColors['Font'] : ButtonToolTips.LIGHT_TEXT
         SendMessage(TTM_SETTIPBKCOLOR, backColor, 0, this.hwnd)
         SendMessage(TTM_SETTIPTEXTCOLOR, textColor, 0, this.hwnd)
+    }
+}
+
+; Switches the keyboard layout to the language of the field that gets the
+; focus. Where the layout is kept per window, it stays with the translator
+; window. With global input settings (one layout for every window, the
+; default since Windows 8) the layout the user had is given back when the
+; translator window loses activation. Found by Tests\KeyboardLayoutProbe.ahk:
+; - ActivateKeyboardLayout from a thread that is no longer in the foreground
+;   does not change the global layout, and calling it inside WM_ACTIVATE
+;   races with the activation. The previous layout is given back with
+;   WM_INPUTLANGCHANGEREQUEST to the window that became active.
+; - Right after the activation GetKeyboardLayout(0) may still report the
+;   layout from before it. The previous layout is taken from the return
+;   value of ActivateKeyboardLayout instead.
+class KeyboardLayoutSwitcher
+{
+    static RESTORE_DELAY_MS := 100   ; the new foreground window is known only after the activation
+         , savedLayout := 0          ; the layout before the translator window took over, 0 if none
+         , setLayout := 0            ; the layout this class set last
+         , monitorInstalled := false
+
+    ; languageCode: the Google code of the language of the field.
+    static OnFieldFocus(languageCode) {
+        static WM_ACTIVATE := 0x06
+        layout := this.FindLayout(languageCode)
+        if !layout {
+            return
+        }
+        if !this.monitorInstalled {
+            ; For the life of the script: a window that is being destroyed
+            ; may already be out of TranslateWindow.guis.
+            OnMessage(WM_ACTIVATE, ObjBindMethod(this, 'WM_ACTIVATE'))
+            this.monitorInstalled := true
+        }
+        previousLayout := DllCall('ActivateKeyboardLayout', 'Ptr', layout, 'UInt', 0, 'Ptr')
+        if !previousLayout || !this.IsGlobal() {
+            this.savedLayout := 0
+            return
+        }
+        ; Moving between the fields or the windows of the translator keeps
+        ; the layout the user had before them.
+        if !this.savedLayout {
+            this.savedLayout := previousLayout
+        }
+        this.setLayout := layout
+    }
+
+    static WM_ACTIVATE(wParam, lParam, msg, hwnd) {
+        if !(wParam & 0xFFFF) && this.savedLayout {
+            SetTimer(ObjBindMethod(this, 'RestoreLayout'), -this.RESTORE_DELAY_MS)
+        }
+    }
+
+    static RestoreLayout() {
+        static WM_INPUTLANGCHANGEREQUEST := 0x50
+        savedLayout := this.savedLayout
+        foreground := DllCall('GetForegroundWindow', 'Ptr')
+        if !savedLayout || !foreground {
+            return
+        }
+        ; Another translator window: the layout is given back when the
+        ; translator is left.
+        if TranslateWindow.guis.Has(foreground) {
+            return
+        }
+        this.savedLayout := 0
+        if savedLayout == this.setLayout || !this.IsGlobal() {
+            return
+        }
+        ; The user has switched the layout by hand: it is theirs.
+        if this.WindowLayout(foreground) != this.setLayout {
+            return
+        }
+        ; Some applications take input in a child window, not in the
+        ; top-level one. An elevated window does not get the message.
+        DllCall('PostMessage', 'Ptr', this.FocusedWindow(foreground), 'UInt', WM_INPUTLANGCHANGEREQUEST,
+                'Ptr', 0, 'Ptr', savedLayout)
+    }
+
+    ; The installed layout for a language. Of several layouts of the language
+    ; the current one is kept, otherwise the first in the user's order wins.
+    static FindLayout(languageCode) {
+        count := DllCall('GetKeyboardLayoutList', 'Int', 0, 'Ptr', 0, 'Int')
+        if count <= 0 {
+            return 0
+        }
+        handles := Buffer(count * A_PtrSize, 0)
+        count := DllCall('GetKeyboardLayoutList', 'Int', count, 'Ptr', handles, 'Int')
+        layouts := []
+        Loop count {
+            layouts.Push(NumGet(handles, (A_Index - 1) * A_PtrSize, 'Ptr'))
+        }
+        return this.PickLayout(languageCode, layouts, DllCall('GetKeyboardLayout', 'UInt', 0, 'Ptr'))
+    }
+
+    ; An exact match of the Google code wins over the same base language
+    ; (pt-PT and a Brazilian layout). Chinese is not matched by the base
+    ; language: Simplified and Traditional Chinese have different input methods.
+    static PickLayout(languageCode, layouts, currentLayout := 0) {
+        languageCode := Trim(languageCode)
+        if languageCode == '' || languageCode = 'auto' {
+            return 0
+        }
+        baseCode := RegExReplace(languageCode, '-.*$')
+        exactLayouts := [], baseLayouts := []
+        for layout in layouts {
+            layoutCode := this.LayoutGoogleCode(layout)
+            if layoutCode = languageCode {
+                exactLayouts.Push(layout)
+            } else if baseCode != 'zh' && RegExReplace(layoutCode, '-.*$') = baseCode {
+                baseLayouts.Push(layout)
+            }
+        }
+        for candidates in [exactLayouts, baseLayouts] {
+            for layout in candidates {
+                if layout == currentLayout {
+                    return layout
+                }
+            }
+            if candidates.Length {
+                return candidates[1]
+            }
+        }
+        return 0
+    }
+
+    ; The Google code of the language of a layout: he-IL gives iw, zh-HK gives zh-TW.
+    static LayoutGoogleCode(layout) {
+        static LOCALE_NAME_MAX_LENGTH := 85
+        localeName := Buffer(LOCALE_NAME_MAX_LENGTH * 2, 0)
+        if DllCall('LCIDToLocaleName', 'UInt', layout & 0xFFFF, 'Ptr', localeName,
+                   'Int', LOCALE_NAME_MAX_LENGTH, 'UInt', 0, 'Int') <= 1 {
+            return ''
+        }
+        return LanguagePairAdvisor.NormalizeGoogleCode(StrGet(localeName, 'UTF-16'))
+    }
+
+    ; False where SystemParametersInfo does not know the setting (before
+    ; Windows 8): there the layout is kept per window.
+    static IsGlobal() {
+        static SPI_GETTHREADLOCALINPUTSETTINGS := 0x104E
+        isLocal := 1
+        DllCall('SystemParametersInfo', 'UInt', SPI_GETTHREADLOCALINPUTSETTINGS, 'UInt', 0,
+                'Int*', &isLocal, 'UInt', 0)
+        return !isLocal
+    }
+
+    static WindowLayout(hwnd) {
+        threadId := DllCall('GetWindowThreadProcessId', 'Ptr', hwnd, 'Ptr', 0, 'UInt')
+        return threadId ? DllCall('GetKeyboardLayout', 'UInt', threadId, 'Ptr') : 0
+    }
+
+    ; The control with the keyboard focus in the thread of a window, or the
+    ; window itself when the thread reports none.
+    static FocusedWindow(hwnd) {
+        threadId := DllCall('GetWindowThreadProcessId', 'Ptr', hwnd, 'Ptr', 0, 'UInt')
+        threadInfo := Buffer(24 + 6 * A_PtrSize, 0)   ; GUITHREADINFO
+        NumPut('UInt', threadInfo.Size, threadInfo)
+        if threadId && DllCall('GetGUIThreadInfo', 'UInt', threadId, 'Ptr', threadInfo, 'Int') {
+            focused := NumGet(threadInfo, 8 + A_PtrSize, 'Ptr')   ; hwndFocus
+            if focused {
+                return focused
+            }
+        }
+        return hwnd
     }
 }
 
@@ -6447,7 +7356,7 @@ class Icons
 class Config {
     ; Keep in sync with ;@Ahk2Exe-SetVersion at the top of the script:
     ; Tools\BuildRelease.ps1 refuses to build when they differ.
-    static VERSION := '1.1.2'
+    static VERSION := '1.2.0'
 
     ; Public keys built into Google's own browser-side clients (Google Translate
     ; website translation and the Google Dictionary extension). They are not the
