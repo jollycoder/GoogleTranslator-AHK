@@ -47,7 +47,7 @@ Right-click the program's tray icon to open the settings menu. The on/off settin
 | `Options` → `Copy Main Translation` | Automatically copy the main translation to the clipboard |
 | `Options` → `Remember Window Size` | Keep the window width and the heights of both text fields: new windows open with this size, and a translation does not resize the window |
 | `Options` → `Switch Keyboard Layout` | When a text field gets the focus, switch the keyboard layout to the language of that field, if such a layout is installed. If Windows uses one layout for all windows, the previous layout is restored when you leave the translator window. In the language lists the layout of the native language is used, as the language names are in it. On by default |
-| `Options` → `Show Romanization` | Show the romanization of text in a non-Latin script (pinyin, romaji, transliterated Cyrillic) in a strip under its text field. The strip appears only for such text; a long romanization scrolls, and hovering over the strip shows all of it. It comes from a separate Google service: if Google does not answer it, only the romanization is missing, not the translation. Off by default |
+| `Options` → `Show Romanization` | Show the romanization of text in a non-Latin script (pinyin, romaji, transliterated Cyrillic) in a strip under its text field, in the font size of the field. The strip appears only for such text; a long romanization scrolls, and hovering over the strip shows all of it. It comes from a separate Google service: if Google does not answer it, only the romanization is missing, not the translation. Off by default |
 | `Add To Startup` | Enable or disable starting the program with Windows |
 | `Clear Cache` | Clear cached translations and speech |
 

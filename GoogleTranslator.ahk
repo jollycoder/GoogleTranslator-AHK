@@ -2,7 +2,7 @@
 #SingleInstance Force
 ;@Ahk2Exe-SetName GoogleTranslator
 ;@Ahk2Exe-SetDescription Google Translate client for Windows
-;@Ahk2Exe-SetVersion 1.2.0
+;@Ahk2Exe-SetVersion 1.2.1
 ;@Ahk2Exe-SetOrigFilename GoogleTranslator.exe
 ; The base path is relative to the compiler folder (AutoHotkey\Compiler).
 ;@Ahk2Exe-Base ..\v2\AutoHotkey64.exe
@@ -2095,6 +2095,11 @@ class TranslateWindow
             this._fontSize%i% := size
             for hwnd, wnd in this.guis {
                 wnd.edit%i%.SetFont('s' . size)
+                ; The romanization strip of the field has its font and two of its lines.
+                if wnd.HasOwnProp('roman' . i) {
+                    wnd.roman%i%.SetFont('s' . size)
+                    this.SetRomanStripHeight(wnd, i, this.RomanStripHeight(size))
+                }
             }
             if !this.HasOwnProp('saveFontSizeTimer' . i) {
                 this.saveFontSizeTimer%i% := ObjBindMethod(this, 'SaveFontSize', i)
@@ -2386,7 +2391,13 @@ class TranslateWindow
                     ; before the positions are taken as the base of this drag.
                     this.LayoutToClientSize(wnd)
                     this.StoreVerticalCoords(wnd)
-                    this.SetLiveLayout(wnd, true)
+                    ; The live layout waits for the first WM_SIZING: a window
+                    ; only moved is not laid out, and switching the live
+                    ; layout off repaints it whole (a flash after the move).
+                    ; The flag is not reset here: this event comes through a
+                    ; hook, queued, and may arrive after the first WM_SIZING,
+                    ; which is sent at once. Reset, the flag left the live
+                    ; layout on after the drag, and the whole window flashed.
                 case EVENT_SYSTEM_MOVESIZEEND:
                     ; Size events of a drag may be lost (see OnGuiSize), the
                     ; last one included, so lay out by the final size.
@@ -2398,7 +2409,10 @@ class TranslateWindow
     static FinishResize(wnd) {
         if this.IsAlive(wnd) {
             this.LayoutToClientSize(wnd)
-            this.SetLiveLayout(wnd, false)
+            if wnd.HasOwnProp('liveResize') && wnd.liveResize {
+                wnd.liveResize := false
+                this.SetLiveLayout(wnd, false)
+            }
             this.SaveWindowSize(wnd)
         }
     }
@@ -2466,9 +2480,16 @@ class TranslateWindow
         return 0
     }
 
+    ; Sent only while the window is resized, not moved, and before its size
+    ; changes: the live layout starts with the first one of a drag.
     static WM_SIZING(wp, lp, msg, hwnd) {
         if this.guis.Has(hwnd) {
-            this.guis[hwnd].edge := ['left', 'right', 'top', 'topLeft', 'topRight', 'bottom', 'bottomLeft', 'bottomRight'][wp]
+            wnd := this.guis[hwnd]
+            wnd.edge := ['left', 'right', 'top', 'topLeft', 'topRight', 'bottom', 'bottomLeft', 'bottomRight'][wp]
+            if !(wnd.HasOwnProp('liveResize') && wnd.liveResize) {
+                wnd.liveResize := true
+                this.SetLiveLayout(wnd, true)
+            }
         }
     }
 
@@ -2485,9 +2506,28 @@ class TranslateWindow
             return
         }
         editNum := (ctrl == wnd.edit1) ? 1 : (ctrl == wnd.edit2) ? 2 : 0
+        ; Over a romanization strip: the font of its field (the strip has it).
+        if !editNum && wnd.HasOwnProp('roman1') {
+            editNum := (ctrl == wnd.roman1) ? 1 : (ctrl == wnd.roman2) ? 2 : 0
+            (editNum && ctrl := wnd.edit%editNum%)
+        }
         if !editNum {
             return
         }
+        ; A new font size resizes the romanization strip, and the layout lets
+        ; waiting threads in: the timer that brings the text back fired there
+        ; and removed itself before it was set again ("Item has no value").
+        ; Restored: the tests call this from their own thread.
+        wasCritical := A_IsCritical
+        Critical
+        try {
+            this.ChangeFontSizeByWheel(wnd, ctrl, editNum, wp)
+        } finally {
+            Critical wasCritical
+        }
+    }
+
+    static ChangeFontSizeByWheel(wnd, ctrl, editNum, wp) {
         controlHwnd := ctrl.hwnd
         ; The text to bring back is taken when the hint first appears, or anew
         ; when something has replaced the hint in the meantime.
@@ -2599,9 +2639,10 @@ class TranslateWindow
         ; it. The strips are created last, hidden and one pixel high: the
         ; window is sized without them, and the controls placed with "y+"
         ; follow the buttons. SetRomanStrips shows them where needed.
-        wnd.SetFont('s10', 'Calibri')
         Loop 2 {
             i := A_Index
+            ; In the font of the field: the tone marks of pinyin need the size.
+            wnd.SetFont('s' . this.fontSize[i], 'Calibri')
             wnd.edit%i%.GetPos(&editX, &editY, &editW, &editH)
             wnd.roman%i% := wnd.AddEdit('x' . editX . ' y' . (editY + editH + this.ROMAN_GAP) . ' w' . editW
                                       . ' h1 Hidden Multi ReadOnly -Tabstop -VScroll -E0x200')
@@ -2612,7 +2653,7 @@ class TranslateWindow
         wnd.romanVisible := [false, false]
         wnd.romanFieldGive := [0, 0]   ; what each field gave to its strip
         wnd.romanSource := ['', '']   ; the texts the romanization in the strips is for
-        wnd.romanStripH := this.RomanStripHeight()
+        wnd.romanStripH := [this.RomanStripHeight(this.fontSize[1]), this.RomanStripHeight(this.fontSize[2])]
         (GoogleTranslator.darkTheme && DarkTheme.SetWindowTheme(wnd))
         ; Above 100% the swap button gets lower (AlignLanguageRow), and the
         ; gap under the language row would grow by as much: the controls
@@ -2823,8 +2864,14 @@ class TranslateWindow
         GoogleTranslator.Translate(text, tl, sl, wnd)
     }
 
-    ; Two lines of the romanization font.
-    static RomanStripHeight() => this.GetTextSize(10, 'Calibri', 'Ag`nAg')[2] + 2
+    ; Two lines of Calibri of a size (the font of the field).
+    static RomanStripHeight(fontSize) {
+        static heights := Map()
+        if !heights.Has(fontSize) {
+            heights[fontSize] := this.GetTextSize(fontSize, 'Calibri', 'Ag`nAg')[2] + 2
+        }
+        return heights[fontSize]
+    }
 
     ; The controls of both halves of the window, the romanization strips
     ; included when the window has them.
@@ -2884,38 +2931,66 @@ class TranslateWindow
         if visible[1] == wnd.romanVisible[1] && visible[2] == wnd.romanVisible[2] {
             return 0
         }
+        return this.ChangeRomanStrips(wnd, visible, wnd.romanStripH.Clone(), resizeWindow)
+    }
+
+    ; A new font size of a field: its strip gets the height of two lines of
+    ; it, laid out as a shown strip is (the window or the field gives the
+    ; difference).
+    static SetRomanStripHeight(wnd, i, stripH) {
+        if wnd.romanStripH[i] == stripH {
+            return
+        }
+        heights := wnd.romanStripH.Clone()
+        heights[i] := stripH
+        if !wnd.romanVisible[i] {
+            wnd.romanStripH := heights
+            return
+        }
+        this.ChangeRomanStrips(wnd, wnd.romanVisible.Clone(), heights, true)
+    }
+
+    static ChangeRomanStrips(wnd, visible, heights, resizeWindow) {
         wasCritical := A_IsCritical
         Critical
         try {
-            return this._SetRomanStrips(wnd, visible, resizeWindow)
+            return this._ChangeRomanStrips(wnd, visible, heights, resizeWindow)
         } finally {
             Critical wasCritical
         }
     }
 
-    static _SetRomanStrips(wnd, visible, resizeWindow) {
+    ; Each strip takes its height and a gap above it (its extent). With
+    ; Remember Window Size the field above the strip takes a change of the
+    ; extent, so the window keeps its size, except that a field gives no
+    ; more than it has above its minimum height: the window grows by the
+    ; rest. Without it the window takes the change. A hidden strip gives the
+    ; field back what the field gave it (romanFieldGive), the rest goes to
+    ; the window, so showing and hiding a strip leave the window as it was.
+    static _ChangeRomanStrips(wnd, visible, heights, resizeWindow) {
         this.LayoutToClientSize(wnd)
-        stripH := wnd.romanStripH
-        extra := stripH + this.ROMAN_GAP
         shift := 0   ; how far the controls below the strip being changed move
         Loop 2 {
             i := A_Index
             wnd.edit%i%.GetPos(, &editY,, &editH)
             editY += shift
-            newEditH := editH
-            if visible[i] && !wnd.romanVisible[i] {
+            oldExtent := wnd.romanVisible[i] ? wnd.romanStripH[i] + this.ROMAN_GAP : 0
+            newExtent := visible[i] ? heights[i] + this.ROMAN_GAP : 0
+            growth := newExtent - oldExtent
+            if !visible[i] && wnd.romanVisible[i] {
+                fieldGive := -wnd.romanFieldGive[i]
+            } else if growth > 0 {
                 fieldGive := GoogleTranslator.rememberSize
-                    ? Max(0, Min(extra, editH - this.MIN_EDIT_HEIGHT)) : 0
-                wnd.romanFieldGive[i] := fieldGive
-                newEditH := editH - fieldGive
-            } else if !visible[i] && wnd.romanVisible[i] {
-                newEditH := editH + wnd.romanFieldGive[i]
-                wnd.romanFieldGive[i] := 0
+                    ? Max(0, Min(growth, editH - this.MIN_EDIT_HEIGHT)) : 0
+            } else {
+                fieldGive := GoogleTranslator.rememberSize ? growth : 0
             }
-            shift += newEditH - editH + (visible[i] - wnd.romanVisible[i]) * extra
+            wnd.romanFieldGive[i] += fieldGive
+            newEditH := editH - fieldGive
+            shift += growth - fieldGive
             this.PlaceControl(wnd.edit%i%, editY, newEditH)
             if visible[i] {
-                wnd.roman%i%.Move(, editY + newEditH + this.ROMAN_GAP,, stripH)
+                wnd.roman%i%.Move(, editY + newEditH + this.ROMAN_GAP,, heights[i])
             }
             wnd.roman%i%.Visible := visible[i]
             wnd.romanVisible[i] := visible[i]
@@ -2928,8 +3003,12 @@ class TranslateWindow
                 this.PlaceControl(wnd.%ctrl%, ctrlY + shift)
             }
         }
+        wnd.romanStripH := heights
         this.AlignLanguageRow(wnd, 2)
-        shownExtra := (visible[1] + visible[2]) * extra
+        shownExtra := 0
+        Loop 2 {
+            (visible[A_Index] && shownExtra += heights[A_Index] + this.ROMAN_GAP)
+        }
         wnd.Opt('+MinSize' . wnd.minW . 'x' . (wnd.baseMinH + shownExtra))
         ; The controls are in place: stored as the base of the layout, a resize
         ; to the new height changes nothing in it.
@@ -2978,6 +3057,12 @@ class TranslateWindow
     ; after the placeholder or the romanization is already shown: only
     ; another text clears it.
     static OnFieldChange(wnd, i, *) {
+        ; The font size hint replaces the text for a moment and brings it back.
+        fieldHwnd := wnd.edit%i%.Hwnd
+        if this.restoreTextExpected.Has(fieldHwnd)
+                && wnd.edit%i%.Text == this.restoreTextExpected[fieldHwnd] {
+            return
+        }
         if wnd.edit%i%.Text != wnd.romanSource[i] {
             this.ClearRomanization(wnd, i)
         }
@@ -3301,11 +3386,11 @@ class TranslateWindow
             Loop 2 {
                 i := A_Index
                 for ctrl in ['txt', 'lng', 'swapLang'] {
-                    wnd.%ctrl . i%.Move(wnd.coords[ctrl . i].x + (width > wnd.coords['center'] * 2 ? center - wnd.coords['center'] : 0))
+                    this.MoveIfChanged(wnd.%ctrl . i%, wnd.coords[ctrl . i].x + (width > wnd.coords['center'] * 2 ? center - wnd.coords['center'] : 0))
                 }
-                wnd.edit%i%.Move(,, width - wnd.MarginX * 2)
-                wnd.trans%i%.Move(width - wnd.MarginX - wnd.coords['trans' . i].w + 1)
-                (wnd.HasOwnProp('roman1') && wnd.roman%i%.Move(,, width - wnd.MarginX * 2))
+                this.MoveIfChanged(wnd.edit%i%,,, width - wnd.MarginX * 2)
+                this.MoveIfChanged(wnd.trans%i%, width - wnd.MarginX - wnd.coords['trans' . i].w + 1)
+                (wnd.HasOwnProp('roman1') && this.MoveIfChanged(wnd.roman%i%,,, width - wnd.MarginX * 2))
             }
         }
     }
@@ -3337,7 +3422,18 @@ class TranslateWindow
                 edit2H := this.MIN_EDIT_HEIGHT
             }
         }
-        this.PlaceFields(wnd, Max(edit1H, this.MIN_EDIT_HEIGHT), Max(edit2H, this.MIN_EDIT_HEIGHT))
+        edit1H := Max(edit1H, this.MIN_EDIT_HEIGHT)
+        edit2H := Max(edit2H, this.MIN_EDIT_HEIGHT)
+        ; The stored positions and the client height are DPI-scaled units
+        ; rounded each on its own, so the buttons may come out a unit off
+        ; the bottom, where AdjustLayout puts them (32 units above it). The
+        ; two passes then moved the bottom field and its buttons back and
+        ; forth on every layout, and the lower half of the window flashed
+        ; even after a mere move of the window. The bottom field takes the
+        ; difference, as AdjustLayout would.
+        bottomShift := edit1H - coords['edit1'].h + edit2H - coords['edit2'].h
+        edit2H += height - 32 - (coords['play2'].y + bottomShift)
+        this.PlaceFields(wnd, edit1H, edit2H)
     }
 
     ; Gives the fields these heights, the controls below each field following
@@ -3387,15 +3483,25 @@ class TranslateWindow
     ; Only for the drag: with WS_EX_COMPOSITED the window repaints whole for
     ; the blinking caret of a field.
     static SetLiveLayout(wnd, live) {
-        static RDW_INVALIDATE := 0x1, RDW_ERASE := 0x4, RDW_ALLCHILDREN := 0x80
-        try {
-            WinSetExStyle((live ? '+' : '-') . this.WS_EX_COMPOSITED, wnd.Hwnd)
-            WinSetStyle((live ? '+' : '-') . this.WS_CLIPCHILDREN, wnd.Hwnd)
-            if !live {
-                DllCall('RedrawWindow', 'Ptr', wnd.Hwnd, 'Ptr', 0, 'Ptr', 0,
-                        'UInt', RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN)
-            }
+        static GWL_STYLE := -16, GWL_EXSTYLE := -20, RDW_UPDATENOW := 0x100, RDW_ALLCHILDREN := 0x80
+        if !this.IsAlive(wnd) {
+            return
         }
+        if !live {
+            ; The last layout is painted while the window is still
+            ; double-buffered. Then the styles go without a repaint: the
+            ; picture is already right, and repainting the window whole made
+            ; it flash when the mouse was released after a resize.
+            DllCall('RedrawWindow', 'Ptr', wnd.Hwnd, 'Ptr', 0, 'Ptr', 0, 'UInt', RDW_UPDATENOW | RDW_ALLCHILDREN)
+        }
+        ; WinSetStyle and WinSetExStyle invalidate the whole window; these
+        ; styles act on the next painting without it.
+        style := DllCall('GetWindowLongPtr', 'Ptr', wnd.Hwnd, 'Int', GWL_STYLE, 'Ptr')
+        exStyle := DllCall('GetWindowLongPtr', 'Ptr', wnd.Hwnd, 'Int', GWL_EXSTYLE, 'Ptr')
+        style := live ? style | this.WS_CLIPCHILDREN : style & ~this.WS_CLIPCHILDREN
+        exStyle := live ? exStyle | this.WS_EX_COMPOSITED : exStyle & ~this.WS_EX_COMPOSITED
+        DllCall('SetWindowLongPtr', 'Ptr', wnd.Hwnd, 'Int', GWL_STYLE, 'Ptr', style, 'Ptr')
+        DllCall('SetWindowLongPtr', 'Ptr', wnd.Hwnd, 'Int', GWL_EXSTYLE, 'Ptr', exStyle, 'Ptr')
     }
 
     static RepaintBackground(wnd) {
@@ -3428,6 +3534,19 @@ class TranslateWindow
         }
     }
 
+    ; Moves a control only when its place or size changes: GuiControl.Move
+    ; repaints the control even when nothing changes, and the layout passes
+    ; at the end of a mere move of the window made its lower half flash.
+    static MoveIfChanged(ctrl, x?, y?, w?, h?) {
+        ctrl.GetPos(&currentX, &currentY, &currentW, &currentH)
+        if (!IsSet(x) || x == currentX) && (!IsSet(y) || y == currentY)
+                && (!IsSet(w) || w == currentW) && (!IsSet(h) || h == currentH) {
+            return false
+        }
+        ctrl.Move(x?, y?, w?, h?)
+        return true
+    }
+
     ; Moves and redraws a control only when its place changes: redrawing
     ; every control on each layout pass makes the window flicker.
     static PlaceControl(ctrl, y, h := '') {
@@ -3456,12 +3575,12 @@ class TranslateWindow
             stripH := 0
             if params.wnd.HasOwnProp('roman2') && params.wnd.romanVisible[2] {
                 params.wnd.roman2.GetPos(,,, &stripH)
-                params.wnd.roman2.Move(, height - 32 - this.ROMAN_GAP - stripH)
+                this.MoveIfChanged(params.wnd.roman2,, height - 32 - this.ROMAN_GAP - stripH)
                 stripH += this.ROMAN_GAP
             }
-            params.wnd.edit2.Move(,,, height - y - 37 - stripH)
+            this.MoveIfChanged(params.wnd.edit2,,,, height - y - 37 - stripH)
             for ctrl in ['play2', 'stop2', 'trans2'] {
-                params.wnd.%ctrl%.Move(, height - 32)
+                this.MoveIfChanged(params.wnd.%ctrl%,, height - 32)
             }
             this.RepaintBackground(params.wnd)
         }
@@ -3489,7 +3608,14 @@ class TranslateWindow
                 wnd.coords[ctrl . i].h := h
             }
         }
-        wnd.coords['height'] := wnd.coords['trans2'].y + wnd.coords['trans2'].h + wnd.MarginY
+        ; The client height this layout is for, by the rule of AdjustLayout
+        ; (the buttons 32 units above the bottom). Counted from the bottom
+        ; of a button and the margin, in units rounded each on its own, it
+        ; came out a unit taller than the window: every layout pass at the
+        ; end of a mere move then gave the field at the dragged edge one
+        ; unit less (after a resize by the top border, the top field shrank
+        ; with every move, and the window flashed when the mouse was released).
+        wnd.coords['height'] := wnd.coords['play2'].y + 32
     }
 }
 
@@ -6624,7 +6750,7 @@ RegisterSyncCallback(funcObj, options := '', paramCount?) {
 ; units of GetPos and Move.
 class FieldSplitter
 {
-    static dragWnd := '', dragStartY := 0, lastDragY := '', monitors := ''
+    static dragWnd := '', dragStartY := 0, lastDragY := '', dragLive := false, monitors := ''
 
     static Install() {
         if IsObject(this.monitors) {
@@ -6689,13 +6815,14 @@ class FieldSplitter
     }
 
     ; The window lays itself out live while the edge is dragged
-    ; (TranslateWindow.SetLiveLayout).
+    ; (TranslateWindow.SetLiveLayout), from the first move of the edge: a
+    ; click on the edge alone would repaint the window whole when it ends.
     static BeginDrag(wnd, startY) {
         TranslateWindow.StoreVerticalCoords(wnd)
         this.dragWnd := wnd
         this.dragStartY := startY
         this.lastDragY := startY
-        TranslateWindow.SetLiveLayout(wnd, true)
+        this.dragLive := false
         DllCall('SetCapture', 'Ptr', wnd.Hwnd)
         this.SetSizeCursor()
     }
@@ -6713,6 +6840,10 @@ class FieldSplitter
             return
         }
         this.lastDragY := y
+        if !this.dragLive {
+            this.dragLive := true
+            TranslateWindow.SetLiveLayout(wnd, true)
+        }
         TranslateWindow.SplitFields(wnd, Round((y - this.dragStartY) * 96 / A_ScreenDPI))
     }
 
@@ -6728,8 +6859,10 @@ class FieldSplitter
         if DllCall('GetCapture', 'Ptr') == wnd.Hwnd {
             DllCall('ReleaseCapture')
         }
+        wasLive := this.dragLive
+        this.dragLive := false
         if TranslateWindow.IsAlive(wnd) {
-            TranslateWindow.SetLiveLayout(wnd, false)
+            (wasLive && TranslateWindow.SetLiveLayout(wnd, false))
             TranslateWindow.StoreVerticalCoords(wnd)
             TranslateWindow.SaveWindowSize(wnd)
         }
@@ -7356,7 +7489,7 @@ class Icons
 class Config {
     ; Keep in sync with ;@Ahk2Exe-SetVersion at the top of the script:
     ; Tools\BuildRelease.ps1 refuses to build when they differ.
-    static VERSION := '1.2.0'
+    static VERSION := '1.2.1'
 
     ; Public keys built into Google's own browser-side clients (Google Translate
     ; website translation and the Google Dictionary extension). They are not the
