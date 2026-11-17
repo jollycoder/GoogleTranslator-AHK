@@ -2,7 +2,7 @@
 #SingleInstance Force
 ;@Ahk2Exe-SetName GoogleTranslator
 ;@Ahk2Exe-SetDescription Google Translate client for Windows
-;@Ahk2Exe-SetVersion 1.2.1
+;@Ahk2Exe-SetVersion 1.3.0
 ;@Ahk2Exe-SetOrigFilename GoogleTranslator.exe
 ; The base path is relative to the compiler folder (AutoHotkey\Compiler).
 ;@Ahk2Exe-Base ..\v2\AutoHotkey64.exe
@@ -1024,7 +1024,8 @@ class GoogleTranslator
             { key: 'rememberSize', iniKey: 'Remember Window Size'           , trayMenuItem: 'Remember Window Size'  },
             { key: 'switchLayout', iniKey: 'Switch Keyboard Layout'         , trayMenuItem: 'Switch Keyboard Layout',
               defaultValue: 1 },
-            { key: 'showRoman', iniKey: 'Show Romanization'                 , trayMenuItem: 'Show Romanization'     }
+            { key: 'showRoman', iniKey: 'Show Romanization'                 , trayMenuItem: 'Show Romanization'     },
+            { key: 'showPronun', iniKey: 'Show Pronunciation'               , trayMenuItem: 'Show Pronunciation'    }
         ]
         for i, item in this.settings {
             this.%item.key% := IniRead(this.iniPath, 'Settings', item.iniKey,
@@ -1379,6 +1380,7 @@ class GoogleTranslator
                 (i == 'Dark Theme' && TranslateWindow.RedrawGuis(this.darkTheme) && this.FakeGui()),
                 (i == 'Remember Window Size' && this.rememberSize && TranslateWindow.SaveWindowSize(TranslateWindow.lastGui)),
                 (i == 'Show Romanization' && TranslateWindow.OnRomanizationToggled()),
+                (i == 'Show Pronunciation' && TranslateWindow.OnPronunciationToggled()),
                 IniWrite(this.%s.key%, this.iniPath, 'Settings', s.iniKey)
             )).Bind(s))
             (this.%s.key% && settingMenu.Check(s.trayMenuItem))
@@ -1580,17 +1582,53 @@ class GoogleTranslator
     ; network for automated: on one computer client=gtx was blocked on every
     ; host while client=dict-chrome-ex was answered (Tests\TransliterationProbe.ahk).
     ; So the endpoints are tried in turn, and a blocked one is skipped for
-    ; ROMAN_BLOCK_MS. While all are blocked no request is sent and no strip
-    ; is shown, so the window does not grow and shrink back with every
-    ; translation. All of them give the same answer.
+    ; ROMAN_BLOCK_MS. While all are blocked no request is sent, and only a
+    ; romanization kept in the cache gets a strip, so the window does not
+    ; grow and shrink back with every translation. All of them give the same
+    ; answer. To make a block less likely, the requests go to the endpoints
+    ; in turn (each request starts with the endpoint after the one that
+    ; answered the last), and not faster than ROMAN_BURST at once and then
+    ; one per ROMAN_REFILL_MS (WaitRomanSlot): a translation asks for two at
+    ; most, a burst comes from quick changes of languages or texts.
     static ROMAN_ENDPOINTS := [
               'https://translate.googleapis.com/translate_a/single?client=dict-chrome-ex&dt=rm',
               'https://clients5.google.com/translate_a/single?client=dict-chrome-ex&dt=rm',
               'https://translate.googleapis.com/translate_a/single?client=gtx&dt=rm'
            ]
-         , ROMAN_BLOCK_MS := 10 * 60 * 1000
+         , ROMAN_BLOCK_MS := 2 * 60 * 1000
          , romanBlockedUntil := [0, 0, 0]   ; A_TickCount, per endpoint
          , romanSessionCache := Map()       ; in front of the disk cache, emptied by Clear Cache
+         , ROMAN_SESSION_MAX := 200         ; entries; the session cache is emptied when full
+         , romanNextEndpoint := 1           ; the endpoint the next request starts with
+         , ROMAN_BURST := 3, ROMAN_REFILL_MS := 1500
+         , romanTokens := 3, romanTokensAt := 0   ; WaitRomanSlot: the requests that may go now
+    ; The order in which the endpoints are tried by the next request.
+    static RomanEndpointOrder() {
+        order := []
+        endpointCount := this.ROMAN_ENDPOINTS.Length
+        Loop endpointCount {
+            order.Push(Mod(this.romanNextEndpoint + A_Index - 2, endpointCount) + 1)
+        }
+        return order
+    }
+
+    ; Waits until a romanization request may be sent: ROMAN_BURST requests
+    ; at once, then one per ROMAN_REFILL_MS. Sleep lets the other threads run
+    ; meanwhile (the window, a newer request that waits too).
+    static WaitRomanSlot() {
+        loop {
+            now := A_TickCount
+            this.romanTokens := Min(this.ROMAN_BURST,
+                                    this.romanTokens + (now - this.romanTokensAt) / this.ROMAN_REFILL_MS)
+            this.romanTokensAt := now
+            if this.romanTokens >= 1 {
+                this.romanTokens -= 1
+                return
+            }
+            Sleep Ceil((1 - this.romanTokens) * this.ROMAN_REFILL_MS)
+        }
+    }
+
     static IsRomanizationBlocked() {
         for blockedUntil in this.romanBlockedUntil {
             if A_TickCount >= blockedUntil {
@@ -1600,51 +1638,142 @@ class GoogleTranslator
         return true
     }
 
+    ; The romanization kept for a text, without asking Google: from the
+    ; session (where an empty answer is kept too: found is true then) or
+    ; from the disk cache, which keeps only found romanizations. One kept
+    ; under an older cut of the text (RomanSegments.Fits) is not found. The
+    ; text and the language as Romanize takes them.
+    static CachedRomanization(text, sl, &found := false) {
+        text := Trim(text, ' `t`r`n')
+        sl := (sl == '' ? 'auto' : sl)
+        cacheKey := sl . '|' . text
+        sessionCache := this.romanSessionCache
+        if sessionCache.Has(cacheKey) {
+            sessionRoman := sessionCache[cacheKey]
+            found := RomanSegments.Fits(text, sessionRoman)
+            return found ? sessionRoman : ''
+        }
+        storedRoman := ''
+        try storedRoman := this.cache.GetRoman(text, sl)
+        found := storedRoman != '' && RomanSegments.Fits(text, storedRoman)
+        if !found {
+            return ''
+        }
+        (sessionCache.Count >= this.ROMAN_SESSION_MAX && sessionCache.Clear())
+        sessionCache[cacheKey] := storedRoman
+        return storedRoman
+    }
+
     ; The romanization of a text (pinyin, romaji, transliterated Cyrillic), or
     ; an empty string. Nothing else in the program depends on these
     ; endpoints: if Google changes them, only the romanization is lost.
     ; Answers are kept for the session, and found romanizations also in the
     ; disk cache with the translations, so a text translated again does not
     ; ask Google even after a restart. Errors are not kept: the next attempt
-    ; asks again.
+    ; asks again. A text of several sentences or lines is sent in segments,
+    ; and its romanization comes back in parts joined by
+    ; RomanSegments.PART_SEP; RomanSegments.Layout makes the text to show.
     static Romanize(text, sl := 'auto') {
+        static MAX_CHARS := 5000
+        text := Trim(text, ' `t`r`n')
+        if text == '' || StrLen(text) > MAX_CHARS || !this.NeedsRomanization(text) {
+            return ''
+        }
+        sl := (sl == '' ? 'auto' : sl)
+        ; What is kept is shown even while Google blocks the requests.
+        cachedRoman := this.CachedRomanization(text, sl, &found)
+        if found || this.IsRomanizationBlocked() {
+            return cachedRoman
+        }
+        ; The sentences and lines go in one request, joined by a separator,
+        ; so that the answer can be tied to them (RomanSegments).
+        segments := RomanSegments.Split(text)
+        query := RomanSegments.Query(text, segments, &separator)
+        return this.FetchRomanization(text, sl, query, separator, segments.Length)
+    }
+
+    ; The pronunciation Google's dictionary gives for one word in Latin script
+    ; (dt=rm gives it, as the romanization of other scripts), or ''. Only for
+    ; the languages of PRONUNCIATION_LANGS: of 23 tried (2026-11-17) only
+    ; English, Italian and German had it, and not for every word ("house" has
+    ; none). Not IPA: English comes as a dictionary respelling ("ˈwôdər"),
+    ; Italian as syllables with the stress ("cà·sa"), German with a stress
+    ; mark ("Haús"). A phrase, or words joined by the separator of
+    ; RomanSegments, gets none. Kept and limited as the romanization.
+    static Pronounce(word, lang) {
+        word := Trim(word, ' `t`r`n')
+        if !this.IsPronounceable(word, lang) {
+            return ''
+        }
+        unanswered := false
+        for wordForm in this.PronunciationForms(word, lang) {
+            pron := this.CachedRomanization(wordForm, lang, &found)
+            if !found && !this.IsRomanizationBlocked() {
+                pron := this.FetchRomanization(wordForm, lang, wordForm, '', 1)
+                ; An answer, even an empty one, is kept in the session.
+                this.CachedRomanization(wordForm, lang, &found)
+            }
+            if pron != '' {
+                this.pronounceFailed := false
+                return pron
+            }
+            (!found && unanswered := true)
+        }
+        this.pronounceFailed := unanswered
+        return ''
+    }
+
+    ; Whether the last Pronounce that gave '' did so because Google did not
+    ; answer (blocked, a network error), not because the word has none.
+    static pronounceFailed := false
+
+    ; The forms of a word to ask for, in turn. Google has English and Italian
+    ; words only in lower case ("the", not "The"; "casa", not "Casa"), German
+    ; ones as they are written: nouns with a capital ("Haus", not "haus"). A
+    ; German word with a capital that has none is asked for in lower case
+    ; too: a verb or an adjective at the start of a sentence. (2026-11-17)
+    static PronunciationForms(word, lang) {
+        lowerWord := StrLower(word)
+        if lang != 'de' {
+            return [lowerWord]
+        }
+        return word == lowerWord ? [word] : [word, lowerWord]
+    }
+
+    static PRONUNCIATION_LANGS := Map('en', true, 'it', true, 'de', true)
+
+    ; One word of Latin letters (an apostrophe or a hyphen inside it allowed)
+    ; in a language Google has pronunciations for.
+    static IsPronounceable(word, lang) => this.PRONUNCIATION_LANGS.Has(lang)
+        && RegExMatch(word, "^\p{Latin}+(?:['’-]\p{Latin}+)*$") > 0
+
+    ; Asks Google for the romanization of query (text as it is sent) and keeps
+    ; the answer for text: in the session, and on disk if it is not empty.
+    ; The endpoints are tried in turn, a blocked one skipped; '' if none
+    ; answers.
+    static FetchRomanization(text, sl, query, separator, segmentCount) {
         static hdrs := Map(
                   'User-Agent'  , 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                                 . 'AppleWebKit/537.36 (KHTML, like Gecko) '
                                 . 'Chrome/138.0.0.0 Safari/537.36',
                   'Content-Type', 'application/x-www-form-urlencoded;charset=UTF-8'
                )
-             , MAX_CHARS := 5000, MAX_CACHED := 200
-        text := Trim(text, ' `t`r`n')
-        if text == '' || StrLen(text) > MAX_CHARS || !this.NeedsRomanization(text)
-                || this.IsRomanizationBlocked() {
-            return ''
-        }
-        sl := (sl == '' ? 'auto' : sl)
         cacheKey := sl . '|' . text
         sessionCache := this.romanSessionCache
-        if sessionCache.Has(cacheKey) {
-            return sessionCache[cacheKey]
-        }
-        storedRoman := ''
-        try storedRoman := this.cache.GetRoman(text, sl)
-        if storedRoman != '' {
-            (sessionCache.Count >= MAX_CACHED && sessionCache.Clear())
-            sessionCache[cacheKey] := storedRoman
-            return storedRoman
-        }
         ; The target language does not matter for dt=rm, but it must differ
         ; from the source one.
         tl := (sl = 'en' ? 'ru' : 'en')
-        for endpointIndex, endpoint in this.ROMAN_ENDPOINTS {
+        for endpointIndex in this.RomanEndpointOrder() {
             if A_TickCount < this.romanBlockedUntil[endpointIndex] {
                 continue
             }
+            endpoint := this.ROMAN_ENDPOINTS[endpointIndex]
+            this.WaitRomanSlot()
             roman := ''
             try {
                 ; POST: the text may be too long for a URL.
                 res := this.wr.Fetch(endpoint . '&sl=' . sl . '&tl=' . tl, 'POST', hdrs,
-                                     'q=' . UrlCodec.Encode(text))
+                                     'q=' . UrlCodec.Encode(query))
                 ; [[[null, null, null, "Nǐ hǎo"]], null, "zh-CN", ...]
                 for segment in LightJson.Parse(res.text)[1] {
                     if segment is Array && segment.Length >= 4 && segment[4] is String {
@@ -1660,8 +1789,10 @@ class GoogleTranslator
                 ; endpoint would not do better.
                 return ''
             }
-            (roman == text && roman := '')
-            (sessionCache.Count >= MAX_CACHED && sessionCache.Clear())
+            this.romanNextEndpoint := Mod(endpointIndex, this.ROMAN_ENDPOINTS.Length) + 1
+            (roman == query && roman := '')
+            (roman != '' && roman := RomanSegments.StoredForm(roman, separator, segmentCount))
+            (sessionCache.Count >= this.ROMAN_SESSION_MAX && sessionCache.Clear())
             sessionCache[cacheKey] := roman
             (roman != '' && this.HasOwnProp('cache') && this.cache.SetRoman(text, sl, roman))
             return roman
@@ -2068,6 +2199,275 @@ class GoogleTranslator
     }
 }
 
+; The sentences and lines of a text, to tie its romanization to it. Google
+; gives the romanization of a whole text as one string, without saying which
+; part is for which sentence, and in some languages without the line breaks
+; (ja, ar). So the text is cut into segments here and sent in one request,
+; joined by a separator that Google leaves as it is: " | " and " 000 " came
+; back intact in zh-CN, ja, ko, th, ar, hi, ru and el; line breaks and " ¶ "
+; did not, and neither did punctuation next to the separator. The answer is
+; cut by the same separator; another number of parts than of segments means
+; no correspondence, and the romanization is shown as before, not tied to the
+; text. Segments are the clauses of the sentences: a sentence ends at a line
+; break or an end mark, a clause at a comma, a semicolon, a colon or a dash,
+; never inside a word (the reading of a kanji depends on its neighbours).
+; The strip shows not the clauses but groups of them (Group): as many
+; neighbouring clauses of a sentence as its two lines hold, so that a short
+; sentence stays whole and a long one is cut where the strip needs it; the
+; groups follow the width and the font of the strip, the request does not.
+; Offsets are 0-based positions in the Edit's own text, as its
+; messages count them: the text is read with WM_GETTEXT (GetRawText), not
+; with Text, which gives `n for `r`n. An Edit may hold either line break,
+; even mixed: AHK puts `n into it as it is, and since Windows 10 1809 an
+; Edit shows a lone `n as a line break.
+class RomanSegments
+{
+    static PART_SEP := Chr(0x1F)   ; between the parts of a kept romanization
+         , SEPARATORS := [{mark: '|'  , query: ' | '  , pattern: '\s*\|\s*'},
+                          {mark: '000', query: ' 000 ', pattern: '\s*000\s*'}]
+         ; A sentence ends with . ! ? … before a space or the end of the text,
+         ; or with a CJK, Devanagari or Arabic end mark; the closing quotes
+         ; and brackets after the mark belong to it.
+         , SENTENCE_PATTERN := 'S)\G[^\r\n]*?(?:[.!?…]+["`'”’»)\]」』）]*(?=\s|$)'
+                             . '|[。！？।॥؟۔]+["`'”’»)\]」』）]*|(?=[\r\n]|$))'
+         ; A clause ends with , ; : (also Arabic ، ؛) or a dash between spaces
+         ; before a space (not "1,000", "3:30"), or with a CJK comma, semicolon
+         ; or colon; the closing quotes and brackets after the mark belong to it.
+         , CLAUSE_PATTERN := 'S)(?:[,;:،؛]["`'”’»)\]」』）]*|\s[—–])(?=\s)|[，、；：]["`'”’»)\]」』）]*'
+         ; A group of clauses shorter than this (a lone "и,") joins a neighbour.
+         , MIN_GROUP_CHARS := 20
+
+    ; The segments of a text, its clauses: [{start, end, sentence}], the end
+    ; exclusive, sentence the number of the sentence of the clause.
+    static Split(text) {
+        segments := []
+        textLen := StrLen(text)
+        pos := 1
+        sentenceNum := 0
+        while pos <= textLen {
+            if RegExMatch(text, 'S)\G\s+', &spaceMatch, pos) {
+                pos += spaceMatch.Len
+                continue
+            }
+            RegExMatch(text, this.SENTENCE_PATTERN, &sentenceMatch, pos)
+            sentenceLen := Max(sentenceMatch.Len, 1)
+            sentenceNum++
+            this.SplitSentence(RTrim(SubStr(text, pos, sentenceLen), ' `t'), pos - 1, sentenceNum, segments)
+            pos += sentenceLen
+        }
+        ; A segment without letters (a list number "1.", a dash) is not sent
+        ; alone: it joins the next segment of its line.
+        k := 1
+        while k < segments.Length {
+            current := segments[k], following := segments[k + 1]
+            if !RegExMatch(this.SegmentText(text, current), '\p{L}')
+                    && !RegExMatch(SubStr(text, current.end + 1, following.start - current.end), '[\r\n]') {
+                following.start := current.start
+                segments.RemoveAt(k)
+            } else {
+                k++
+            }
+        }
+        return segments
+    }
+
+    ; The clauses of a sentence that starts at offset base of the text,
+    ; added to segments.
+    static SplitSentence(sentence, base, sentenceNum, segments) {
+        sentenceLen := StrLen(sentence)
+        clauseFrom := 1
+        searchPos := 1
+        while RegExMatch(sentence, this.CLAUSE_PATTERN, &clauseMatch, searchPos) {
+            clauseEnd := clauseMatch.Pos + clauseMatch.Len   ; the position after the clause
+            if clauseEnd > sentenceLen {
+                break
+            }
+            RegExMatch(sentence, 'S)\G\s*', &spaceMatch, clauseEnd)
+            nextFrom := clauseEnd + spaceMatch.Len
+            if nextFrom > sentenceLen {
+                break
+            }
+            segments.Push({start: base + clauseFrom - 1, end: base + clauseEnd - 1, sentence: sentenceNum})
+            clauseFrom := nextFrom
+            searchPos := nextFrom
+        }
+        segments.Push({start: base + clauseFrom - 1, end: base + sentenceLen, sentence: sentenceNum})
+    }
+
+    static SegmentText(text, segment) => SubStr(text, segment.start + 1, segment.end - segment.start)
+
+    ; Whether a kept romanization fits the present cut of its text: in one
+    ; part (one segment, or not tied), or in as many parts as segments. Kept
+    ; under an older cut, it is asked for again.
+    static Fits(text, roman) {
+        ; An empty answer (none) fits any cut. StrSplit gives no parts for
+        ; it, and it was taken for one of another cut: asked for again each
+        ; time, and a pronunciation without one shown as unanswered ([?]).
+        if roman == '' {
+            return true
+        }
+        partCount := StrSplit(roman, this.PART_SEP).Length
+        return partCount == 1 || partCount == this.Split(text).Length
+    }
+
+    ; What is sent to Google for a text: its segments joined by a separator
+    ; that the text does not contain. With one segment, or without such a
+    ; separator, it is the text itself, and separator is ''.
+    static Query(text, segments, &separator) {
+        separator := ''
+        if segments.Length < 2 {
+            return text
+        }
+        for candidate in this.SEPARATORS {
+            if !InStr(text, candidate.mark) {
+                separator := candidate
+                break
+            }
+        }
+        if !separator {
+            return text
+        }
+        query := ''
+        for index, segment in segments {
+            query .= (index > 1 ? separator.query : '') . this.SegmentText(text, segment)
+        }
+        return query
+    }
+
+    ; The form of Google's answer that is kept and shown: with a separator,
+    ; the parts joined by PART_SEP when there are as many as segments,
+    ; otherwise the answer with spaces for the separators (shown, not tied).
+    static StoredForm(answer, separator, segmentCount) {
+        answer := Trim(answer, ' `t`r`n')
+        if !separator {
+            return answer
+        }
+        joined := RegExReplace(answer, separator.pattern, this.PART_SEP)
+        return StrSplit(joined, this.PART_SEP).Length == segmentCount
+            ? joined
+            : StrReplace(joined, this.PART_SEP, ' ')
+    }
+
+    ; The romanization to show for the text of a field (its own text, see
+    ; above), and the ranges that tie it to the text: {text, ranges}, the
+    ; ranges [{srcStart, srcEnd, romStart, romEnd, sentence}], one for each
+    ; clause, or none. Between the parts go the line breaks of the field
+    ; itself, as `r`n (Google loses them in some languages), or a space.
+    static Layout(fieldText, roman) {
+        text := fieldText
+        roman := this.NormalizeLineBreaks(roman)
+        segments := this.Split(text)
+        parts := StrSplit(roman, this.PART_SEP)
+        if !segments.Length || parts.Length != segments.Length {
+            return {text: StrReplace(roman, this.PART_SEP, ' '), ranges: []}
+        }
+        shown := ''
+        ranges := []
+        for index, segment in segments {
+            if index > 1 {
+                previousEnd := segments[index - 1].end
+                RegExReplace(SubStr(text, previousEnd + 1, segment.start - previousEnd), '\r\n|\r|\n',, &lineBreaks)
+                if lineBreaks {
+                    Loop lineBreaks {
+                        shown .= '`r`n'
+                    }
+                } else {
+                    shown .= ' '
+                }
+            }
+            romStart := StrLen(shown)
+            shown .= Trim(parts[index], ' `t`r`n')
+            ranges.Push({srcStart: segment.start, srcEnd: segment.end, romStart: romStart, romEnd: StrLen(shown),
+                         sentence: segment.sentence})
+        }
+        return {text: shown, ranges: ranges}
+    }
+
+    static NormalizeLineBreaks(str) => StrReplace(StrReplace(StrReplace(str, '`r`n', '`n'), '`r', '`n'), '`n', '`r`n')
+
+    ; The ranges a selection covers, by the names of their bounds on its
+    ; side. A caret (an empty selection) is in the segment it is in or right
+    ; after; of two such, in the first.
+    static Covered(ranges, selStart, selEnd, startName, endName) {
+        found := []
+        for range in ranges {
+            caretIn := range.%startName% <= selStart && selStart <= range.%endName%
+            overlaps := range.%startName% < selEnd && range.%endName% > selStart
+            if selStart == selEnd ? caretIn : overlaps {
+                found.Push(range)
+                if selStart == selEnd {
+                    break
+                }
+            }
+        }
+        return found
+    }
+
+    ; The ranges of the clauses (Layout) put together in groups for a strip:
+    ; neighbouring clauses of one sentence, as many as maxLines lines of the
+    ; strip hold (lineOf gives the line of a position in the strip). A clause
+    ; longer than that is a group of its own; a group shorter than
+    ; MIN_GROUP_CHARS joins a neighbour of its sentence, the one before it or
+    ; else the one after it, even if the strip then cannot show it whole.
+    static Group(parts, lineOf, maxLines := 2) {
+        groups := []
+        for part in parts {
+            lastGroup := groups.Length ? groups[-1] : ''
+            if IsObject(lastGroup) && lastGroup.sentence == part.sentence
+                    && lineOf(Max(lastGroup.romStart, part.romEnd - 1)) - lineOf(lastGroup.romStart) < maxLines {
+                lastGroup.srcEnd := part.srcEnd
+                lastGroup.romEnd := part.romEnd
+            } else {
+                groups.Push({srcStart: part.srcStart, srcEnd: part.srcEnd,
+                             romStart: part.romStart, romEnd: part.romEnd, sentence: part.sentence})
+            }
+        }
+        k := 1
+        while k <= groups.Length {
+            shortGroup := groups[k]
+            if shortGroup.romEnd - shortGroup.romStart >= this.MIN_GROUP_CHARS {
+                k++
+            } else if k > 1 && groups[k - 1].sentence == shortGroup.sentence {
+                groups[k - 1].srcEnd := shortGroup.srcEnd
+                groups[k - 1].romEnd := shortGroup.romEnd
+                groups.RemoveAt(k)
+            } else if k < groups.Length && groups[k + 1].sentence == shortGroup.sentence {
+                groups[k + 1].srcStart := shortGroup.srcStart
+                groups[k + 1].romStart := shortGroup.romStart
+                groups.RemoveAt(k)
+            } else {
+                k++
+            }
+        }
+        return groups
+    }
+
+    ; The place in the romanization of a range that matches a place in its
+    ; text, by the proportion of their lengths: not exact, but close within
+    ; a sentence. Inside the range, before its end.
+    static RomanPosition(range, srcPos) {
+        srcLen := range.srcEnd - range.srcStart
+        romLen := range.romEnd - range.romStart
+        if srcLen <= 0 || romLen <= 0 {
+            return range.romStart
+        }
+        share := Max(0, Min(1, (srcPos - range.srcStart) / srcLen))
+        return range.romStart + Min(romLen - 1, Round(share * romLen))
+    }
+
+    ; The place in the text of a range that matches a place in its
+    ; romanization: RomanPosition the other way.
+    static SourcePosition(range, romPos) {
+        srcLen := range.srcEnd - range.srcStart
+        romLen := range.romEnd - range.romStart
+        if srcLen <= 0 || romLen <= 0 {
+            return range.srcStart
+        }
+        share := Max(0, Min(1, (romPos - range.romStart) / romLen))
+        return range.srcStart + Min(srcLen - 1, Round(share * srcLen))
+    }
+}
+
 class TranslateWindow
 {
     static guis := LinkedOrderedMap(), lastGui := ''
@@ -2076,6 +2476,18 @@ class TranslateWindow
          , BUTTON_FRAME_INSET := 1   ; pixels between the rectangle of a themed button and its frame
          , WS_EX_COMPOSITED := 0x02000000, WS_CLIPCHILDREN := 0x02000000   ; SetLiveLayout
          , romanizer := (text, sl) => GoogleTranslator.Romanize(text, sl)   ; replaced by the tests
+         , pronouncer := (word, lang) => GoogleTranslator.Pronounce(word, lang)   ; replaced by the tests
+         , PRON_GAP := 8   ; between the pronunciation and the buttons on each side of it
+         , ctrlDownSinceSwap := false   ; WM_KEYDOWN: Ctrl pressed anew since the last Ctrl+Tab
+         ; The romanization strips and the pronunciations lie on a tinted
+         ; background (TINT_*, as RGB), the text inside it kept off its edges
+         ; (pixels at 100%, PadText): they are made from the text, not the
+         ; text itself. Full-strength text: muted text read badly in the dark
+         ; theme.
+         , TINT_LIGHT := 0xE4E8EE, TINT_DARK := 0x2C2F34
+         , TEXT_LIGHT := 0x000000, TEXT_DARK := 0xE0E0E0
+         , ROMAN_PAD_X := 6, ROMAN_PAD_Y := 3, PRON_PAD_X := 6   ; the pronunciation: as high as the buttons, the text centred
+         , tintedHwnds := Map()   ; the controls WM_CTLCOLORSTATIC tints
          ; Dragging the edge between the fields (FieldSplitter); false turns it off.
          , FIELD_SPLITTER := true
          , resizeParams := {wnd: ''}
@@ -2099,6 +2511,8 @@ class TranslateWindow
                 if wnd.HasOwnProp('roman' . i) {
                     wnd.roman%i%.SetFont('s' . size)
                     this.SetRomanStripHeight(wnd, i, this.RomanStripHeight(size))
+                    ; The font reset the padding, also when the height stays.
+                    this.PadText(wnd.roman%i%, this.ROMAN_PAD_X, this.ROMAN_PAD_Y)
                 }
             }
             if !this.HasOwnProp('saveFontSizeTimer' . i) {
@@ -2136,6 +2550,10 @@ class TranslateWindow
         this.lastSl := sl
         SetTimer wnd.waitTimer, tTxt == '' ? 300 : 0
         this.ClearRomanization(wnd)
+        this.ResetPronunciation(wnd)
+        if tTxt != '' && GoogleTranslator.showPronun {
+            SetTimer(ObjBindMethod(this, 'FillPronunciation', wnd), -1)
+        }
         if tTxt != '' {
             ; Whether a field gets a strip is known from its text, before the
             ; romanization comes: the window is resized once, with the
@@ -2233,6 +2651,10 @@ class TranslateWindow
             OnMessage(0x214, this.onSizing     := ObjBindMethod(this, 'WM_SIZING'))
             OnMessage(0x20A, this.onMouseWheel := ObjBindMethod(this, 'WM_MOUSEWHEEL'))
             OnMessage(0x100, this.onKeyDown    := ObjBindMethod(this, 'WM_KEYDOWN'))
+            OnMessage(0x101, this.onSelectionEnd := ObjBindMethod(this, 'SyncRomanSelection'))   ; WM_KEYUP
+            OnMessage(0x202, this.onSelectionEnd)                                                ; WM_LBUTTONUP
+            ; Before the handler of DarkTheme (-1), which paints read-only edits as the window.
+            OnMessage(0x138, this.onCtlColorStatic := ObjBindMethod(this, 'WM_CTLCOLORSTATIC'), -1)
             (this.FIELD_SPLITTER && FieldSplitter.Install())
         }
         ; A window opened with a ready translation (from the cache) already
@@ -2373,10 +2795,19 @@ class TranslateWindow
             OnMessage(0x214, this.onSizing    , 0)
             OnMessage(0x20A, this.onMouseWheel, 0)
             OnMessage(0x100, this.onKeyDown   , 0)
+            OnMessage(0x101, this.onSelectionEnd, 0)
+            OnMessage(0x202, this.onSelectionEnd, 0)
+            OnMessage(0x138, this.onCtlColorStatic, 0)
             FieldSplitter.Uninstall()
             this.hook := ''
         }
         SetTimer removedWnd.waitTimer, 0
+        for tintedName in ['roman1', 'roman2', 'pron1', 'pron2'] {
+            (this.tintedHwnds.Has(removedWnd.%tintedName%.Hwnd) && this.tintedHwnds.Delete(removedWnd.%tintedName%.Hwnd))
+        }
+        for pronWaitTimer in removedWnd.pronWaitTimers {
+            SetTimer pronWaitTimer, 0
+        }
         removedWnd.Destroy()
     }
 
@@ -2434,6 +2865,12 @@ class TranslateWindow
 
     static WM_KEYDOWN(wp, lp, msg, hwnd) {
         static VK_TAB := 0x09, VK_ENTER := 0x000D, VK_CONTROL := 0x11, GA_ROOT := 2
+        ; A new press of Ctrl (not its auto-repeat) makes the next Ctrl+Tab a
+        ; new one whatever its auto-repeat bit says (see below).
+        if wp == VK_CONTROL {
+            (!(lp & (1 << 30)) && this.ctrlDownSinceSwap := true)
+            return
+        }
         if wp == VK_TAB {
             ; The key state as of this message, not the current one.
             if !(DllCall('GetKeyState', 'Int', VK_CONTROL, 'Short') & 0x8000) {
@@ -2446,8 +2883,16 @@ class TranslateWindow
                 return
             }
             ; Bit 30 marks the auto-repeat of a held key: the languages would
-            ; swap back and forth.
-            if !(lp & (1 << 30)) {
+            ; swap back and forth. But a low-level keyboard hook of another
+            ; program may swallow the key-up of Tab (a log, 2026-11-17: no
+            ; WM_KEYUP of Tab after a switch of the keyboard layout, and Tab
+            ; down even for GetAsyncKeyState), and then every later press of
+            ; Tab comes with that bit, so Ctrl+Tab worked once and then not
+            ; at all, or every other time. The key-up of Ctrl still came: a
+            ; press of Ctrl since the last swap makes this a new Ctrl+Tab.
+            ; Held Ctrl+Tab still repeats nothing.
+            if !(lp & (1 << 30)) || this.ctrlDownSinceSwap {
+                this.ctrlDownSinceSwap := false
                 this.SwapLanguages(this.guis[rootHwnd])
             }
             ; Ctrl+Tab would insert a tab character into a multi-line field.
@@ -2470,13 +2915,15 @@ class TranslateWindow
         ; Shift+Enter inserts a line break: the edits have no WantReturn, so
         ; a plain Enter would reach the default button instead.
         isRomanField := wnd.HasOwnProp('roman1') && (ctrl == wnd.roman1 || ctrl == wnd.roman2)
+                     || wnd.HasOwnProp('pron1') && (ctrl == wnd.pron1 || ctrl == wnd.pron2)
         if ctrl.Type == 'Edit' && !isRomanField && GetKeyState('Shift') {
             EditPaste('`r`n', ctrl)
             return 0
         }
         ; Enter in the bottom field (or in its romanization) acts like its own
         ; reverse-translation button.
-        this.TranslateFromGui(wnd, ctrl == wnd.edit2 || (isRomanField && ctrl == wnd.roman2) ? 'backward' : 'forward')
+        this.TranslateFromGui(wnd, ctrl == wnd.edit2 || (isRomanField && (ctrl == wnd.roman2 || ctrl == wnd.pron2))
+                                   ? 'backward' : 'forward')
         return 0
     }
 
@@ -2495,8 +2942,11 @@ class TranslateWindow
 
     static WM_MOUSEWHEEL(wp, lp, msg, hwnd) {
         static MK_CONTROL := 0x8
-        if !((wp & MK_CONTROL) && ctrl := GuiCtrlFromHwnd(hwnd)) {
+        if !(ctrl := GuiCtrlFromHwnd(hwnd)) {
             return
+        }
+        if !(wp & MK_CONTROL) {
+            return this.WheelOverStrip(ctrl, wp)
         }
         try wnd := ctrl.Gui
         catch {
@@ -2635,33 +3085,73 @@ class TranslateWindow
         }
         ; The romanization of each field's text, in a strip of two lines under
         ; it: read-only and borderless, so it can be selected and copied apart
-        ; from the text. A longer text scrolls, and the tooltip shows all of
-        ; it. The strips are created last, hidden and one pixel high: the
+        ; from the text. A longer text scrolls; the strip has no tooltip: it
+        ; follows the caret of the field. The strips are created last, hidden and one pixel high: the
         ; window is sized without them, and the controls placed with "y+"
-        ; follow the buttons. SetRomanStrips shows them where needed.
+        ; follow the buttons. SetRomanStrips shows them where needed. The
+        ; selection of a strip stays visible: it marks the segment of the
+        ; caret in the field (ShowSegmentInStrip).
         Loop 2 {
             i := A_Index
             ; In the font of the field: the tone marks of pinyin need the size.
             wnd.SetFont('s' . this.fontSize[i], 'Calibri')
             wnd.edit%i%.GetPos(&editX, &editY, &editW, &editH)
             wnd.roman%i% := wnd.AddEdit('x' . editX . ' y' . (editY + editH + this.ROMAN_GAP) . ' w' . editW
-                                      . ' h1 Hidden Multi ReadOnly -Tabstop -VScroll -E0x200')
+                                      . ' h1 Hidden Multi ReadOnly -Tabstop -VScroll -E0x200 ' . ES_NOHIDESEL)
             ; First: the callback enabling the play button returns a value,
             ; which stops the callbacks after it.
             wnd.edit%i%.OnEvent('Change', ObjBindMethod(this, 'OnFieldChange', wnd, i), -1)
+            wnd.edit%i%.OnCommand(0x602, ObjBindMethod(this, 'OnFieldScroll', wnd, i))   ; EN_VSCROLL
         }
+        ; The pronunciation of a word of each field (Show Pronunciation), in
+        ; the row of its buttons, between Stop and the translate button: it
+        ; is shown when it comes and does not change the size of the window,
+        ; also when Google has none. One line, scrolled sideways when it is
+        ; longer than the place. Created last as well: a control placed with
+        ; "y+" would take it for the one before.
+        pronTextH := this.GetTextSize(10, 'Segoe UI', 'Ag')[2]
+        wnd.SetFont('s10', 'Segoe UI')
+        Loop 2 {
+            i := A_Index
+            wnd.stop%i%.GetPos(&stopX, &stopY, &stopW, &stopH)
+            wnd.trans%i%.GetPos(&transX)
+            pronX := stopX + stopW + this.PRON_GAP
+            wnd.pron%i% := wnd.AddEdit('x' . pronX . ' y' . stopY
+                                     . ' w' . Max(0, transX - this.PRON_GAP - pronX) . ' h' . stopH
+                                     . ' Hidden Multi -Wrap -VScroll ReadOnly -Tabstop -E0x200')
+            wnd.pronPadY := Max(0, (stopH - pronTextH) // 2)
+            this.PadText(wnd.pron%i%, this.PRON_PAD_X, wnd.pronPadY)
+        }
+        for tintedName in ['roman1', 'roman2', 'pron1', 'pron2'] {
+            this.tintedHwnds[wnd.%tintedName%.Hwnd] := true
+        }
+        wnd.pron1.GetPos(, &pronY)
+        wnd.stop1.GetPos(, &stopY)
+        wnd.pronOffsetY := pronY - stopY   ; AdjustLayout puts it by the buttons
+        wnd.pronAuto := ['', '']       ; the pronunciation of the main word of each field, as shown
+        wnd.pronAutoWord := ['', '']   ; that word
+        wnd.pronWord := ['', '']       ; the selected word whose pronunciation is shown instead
+        wnd.pronDots := [0, 0]         ; WaitForPronunciation: the dots shown while it is asked for
+        wnd.pronWaitTimers := [ObjBindMethod(this, 'WaitForPronunciation', wnd, 1),
+                               ObjBindMethod(this, 'WaitForPronunciation', wnd, 2)]
         wnd.romanVisible := [false, false]
         wnd.romanFieldGive := [0, 0]   ; what each field gave to its strip
         wnd.romanSource := ['', '']   ; the texts the romanization in the strips is for
+        wnd.romanParts := [[], []]    ; RomanSegments.Layout: the clauses of the strip tied to the field
+        wnd.romanRanges := [[], []]   ; RomanSegments.Group: the groups of them shown (RomanGroups)
+        wnd.romanGroupKey := ['', '']   ; the width and font of the strip the groups are for
+        wnd.romanOwnTop := [-1, -1]     ; the top line of a field scrolled by the program (ShowSegmentInField)
+        wnd.romanWheelRest := [0, 0]    ; WheelOverStrip: the part of a notch of the wheel not used yet
         wnd.romanStripH := [this.RomanStripHeight(this.fontSize[1]), this.RomanStripHeight(this.fontSize[2])]
         (GoogleTranslator.darkTheme && DarkTheme.SetWindowTheme(wnd))
+        this.PadTintedText(wnd)   ; the theme reset the padding
         ; Above 100% the swap button gets lower (AlignLanguageRow), and the
         ; gap under the language row would grow by as much: the controls
         ; below the row move up by it. AHK sizes the window by where the
         ; controls were created, so the height it needs is kept for Show.
-        static belowRow := [['edit1', 'play1', 'stop1', 'trans1', 'roman1',
-                             'txt2', 'lng2', 'swapLang2', 'edit2', 'play2', 'stop2', 'trans2', 'roman2'],
-                            ['edit2', 'play2', 'stop2', 'trans2', 'roman2']]
+        static belowRow := [['edit1', 'play1', 'stop1', 'pron1', 'trans1', 'roman1',
+                             'txt2', 'lng2', 'swapLang2', 'edit2', 'play2', 'stop2', 'pron2', 'trans2', 'roman2'],
+                            ['edit2', 'play2', 'stop2', 'pron2', 'trans2', 'roman2']]
         Loop 2 {
             i := A_Index
             rowBottom := this.ClientRect(wnd.swapLang%i%).bottom
@@ -2795,6 +3285,7 @@ class TranslateWindow
         for hwnd in this.guis {
             wnd := GuiFromHwnd(hwnd)
             DarkTheme.SetWindowTheme(wnd, theme)
+            this.PadTintedText(wnd)   ; the theme reset the padding
             (wnd.HasOwnProp('buttonHints') && wnd.buttonHints.ApplyTheme(theme))
             WinRedraw(wnd)
             this.SetSelToCB(wnd.lng1)
@@ -2864,29 +3355,93 @@ class TranslateWindow
         GoogleTranslator.Translate(text, tl, sl, wnd)
     }
 
-    ; Two lines of Calibri of a size (the font of the field).
+    ; Two lines of Calibri of a size (the font of the field), and the padding
+    ; above and below them (PadText).
     static RomanStripHeight(fontSize) {
         static heights := Map()
         if !heights.Has(fontSize) {
-            heights[fontSize] := this.GetTextSize(fontSize, 'Calibri', 'Ag`nAg')[2] + 2
+            heights[fontSize] := this.GetTextSize(fontSize, 'Calibri', 'Ag`nAg')[2] + 2 + this.ROMAN_PAD_Y * 2
         }
         return heights[fontSize]
     }
 
-    ; The controls of both halves of the window, the romanization strips
-    ; included when the window has them.
+    ; Keeps the text of a tinted edit off the edges of its background: the
+    ; formatting rectangle inside the client area, by padX and padY units.
+    ; An Edit resets that rectangle when its size changes, when it gets a
+    ; font (even of the same height) and when its theme is set (a probe:
+    ; moving, hiding and showing it, or new text keep it), so this follows
+    ; each of those (PadTintedText for the last two). EM_SETRECTNP does not
+    ; redraw (a change of size does), so a layout pass that changes nothing
+    ; repaints nothing.
+    static PadText(ctrl, padX, padY) {
+        static EM_SETRECTNP := 0xB4
+        clientRect := Buffer(16, 0)
+        DllCall('GetClientRect', 'Ptr', ctrl.Hwnd, 'Ptr', clientRect)
+        scale := A_ScreenDPI / 96
+        NumPut('Int', Round(padX * scale), 'Int', Round(padY * scale),
+               'Int', NumGet(clientRect, 8, 'Int') - Round(padX * scale),
+               'Int', NumGet(clientRect, 12, 'Int') - Round(padY * scale), clientRect)
+        SendMessage(EM_SETRECTNP, 0, clientRect, ctrl)
+    }
+
+    ; The background and the text of the tinted controls (tintedHwnds) in
+    ; the theme of their window. Called before the handler of DarkTheme,
+    ; which would paint them as the window.
+    static WM_CTLCOLORSTATIC(wParam, lParam, msg, hwnd) {
+        if !this.tintedHwnds.Has(lParam) {
+            return
+        }
+        dark := DarkTheme.DarkByHwnd.Has(hwnd) && DarkTheme.DarkByHwnd[hwnd]
+        tint := this.RgbToBgr(dark ? this.TINT_DARK : this.TINT_LIGHT)
+        DllCall('SetTextColor', 'Ptr', wParam, 'UInt', this.RgbToBgr(dark ? this.TEXT_DARK : this.TEXT_LIGHT))
+        DllCall('SetBkColor', 'Ptr', wParam, 'UInt', tint)
+        DllCall('SetDCBrushColor', 'Ptr', wParam, 'UInt', tint, 'UInt')
+        return DllCall('GetStockObject', 'Int', 18, 'Ptr')   ; DC_BRUSH
+    }
+
+    ; The padding of every tinted control of a window, after its theme or a
+    ; font is set.
+    static PadTintedText(wnd) {
+        if !wnd.HasOwnProp('pron1') {
+            return
+        }
+        Loop 2 {
+            this.PadText(wnd.roman%A_Index%, this.ROMAN_PAD_X, this.ROMAN_PAD_Y)
+            this.PadText(wnd.pron%A_Index%, this.PRON_PAD_X, wnd.pronPadY)
+        }
+    }
+
+    static RgbToBgr(rgb) => (rgb & 0xFF) << 16 | rgb & 0xFF00 | rgb >> 16 & 0xFF
+
+    ; The controls of both halves of the window, the romanization strips and
+    ; the pronunciations included when the window has them.
     static LayoutControlNames(wnd) {
         names := ['txt', 'lng', 'swapLang', 'edit', 'play', 'stop', 'trans']
         (wnd.HasOwnProp('roman1') && names.Push('roman'))
+        (wnd.HasOwnProp('pron1') && names.Push('pron'))
         return names
     }
 
     ; Which fields get a romanization strip: those with letters outside the
-    ; Latin script, while Show Romanization is on.
-    static RomanStripsWanted(sourceText, translation) {
-        available := GoogleTranslator.showRoman && !GoogleTranslator.IsRomanizationBlocked()
-        return [available && GoogleTranslator.NeedsRomanization(sourceText),
-                available && GoogleTranslator.NeedsRomanization(translation)]
+    ; Latin script, while Show Romanization is on. While Google blocks the
+    ; requests, only a field whose romanization is kept in the cache: that
+    ; needs the languages of the fields (without them, none).
+    static RomanStripsWanted(sourceText, translation, sl?, tl?) {
+        if !GoogleTranslator.showRoman {
+            return [false, false]
+        }
+        blocked := GoogleTranslator.IsRomanizationBlocked()
+        wanted := []
+        for index, fieldText in [sourceText, translation] {
+            fieldWanted := GoogleTranslator.NeedsRomanization(fieldText)
+            if fieldWanted && blocked {
+                fieldWanted := index == 1
+                    ? IsSet(sl) && GoogleTranslator.CachedRomanization(fieldText, sl) != ''
+                    : IsSet(tl) && GoogleTranslator.CachedRomanization(fieldText, tl) != ''
+            }
+            wanted.Push(fieldWanted)
+        }
+        return wanted
     }
 
     ; Shows the strips the texts of a window need, with a placeholder, and
@@ -2895,7 +3450,8 @@ class TranslateWindow
         if !wnd.HasOwnProp('roman1') {
             return 0
         }
-        wanted := this.RomanStripsWanted(wnd.edit1.Text, translation)
+        wanted := this.RomanStripsWanted(wnd.edit1.Text, translation,
+                                         this.LangNameToCode(wnd.lng1.Text), this.LangNameToCode(wnd.lng2.Text))
         heightDelta := this.SetRomanStrips(wnd, wanted[1], wanted[2], resizeWindow)
         wnd.romanSource := [wnd.edit1.Text, wnd.edit2.Text]
         Loop 2 {
@@ -2991,14 +3547,15 @@ class TranslateWindow
             this.PlaceControl(wnd.edit%i%, editY, newEditH)
             if visible[i] {
                 wnd.roman%i%.Move(, editY + newEditH + this.ROMAN_GAP,, heights[i])
+                this.PadText(wnd.roman%i%, this.ROMAN_PAD_X, this.ROMAN_PAD_Y)
             }
             wnd.roman%i%.Visible := visible[i]
             wnd.romanVisible[i] := visible[i]
             ; The controls below the field, down to the next field (which is
             ; moved at the start of its own pass): the second half moves by
             ; the change of the first strip, the bottom buttons by both.
-            for ctrl in (i == 1 ? ['play1', 'stop1', 'trans1', 'txt2', 'lng2', 'swapLang2']
-                                : ['play2', 'stop2', 'trans2']) {
+            for ctrl in (i == 1 ? ['play1', 'stop1', 'pron1', 'trans1', 'txt2', 'lng2', 'swapLang2']
+                                : ['play2', 'stop2', 'pron2', 'trans2']) {
                 wnd.%ctrl%.GetPos(, &ctrlY)
                 this.PlaceControl(wnd.%ctrl%, ctrlY + shift)
             }
@@ -3047,10 +3604,333 @@ class TranslateWindow
         }
     }
 
+    ; The romanization of the text in a field (as Romanize gives it), tied to
+    ; the text where its parts match the segments.
     static SetRomanization(wnd, i, roman) {
-        roman := StrReplace(StrReplace(StrReplace(roman, '`r`n', '`n'), '`r', '`n'), '`n', '`r`n')
-        wnd.roman%i%.Value := roman
-        try wnd.buttonHints.SetText(wnd.roman%i%, roman)
+        layout := RomanSegments.Layout(this.GetRawText(wnd.edit%i%), roman)
+        wnd.roman%i%.Value := layout.text
+        wnd.romanParts[i] := layout.ranges
+        wnd.romanOwnTop[i] := -1     ; a new strip: the marks of the old one go
+        wnd.romanWheelRest[i] := 0
+        wnd.romanGroupKey[i] := ''
+        this.RomanGroups(wnd, i)
+    }
+
+    ; The groups of clauses shown by the strip of field i (RomanSegments.Group),
+    ; made anew when the width or the font of the strip has changed: the
+    ; lines they are measured by change with them. Asked for when they are
+    ; used, so the layout code does not need to know about them.
+    static RomanGroups(wnd, i) {
+        static WM_GETFONT := 0x31, EM_LINEFROMCHAR := 0xC9
+        parts := wnd.romanParts[i]
+        if !parts.Length {
+            wnd.romanRanges[i] := []
+            return wnd.romanRanges[i]
+        }
+        strip := wnd.roman%i%
+        strip.GetPos(,, &stripW)
+        groupKey := stripW . '|' . SendMessage(WM_GETFONT, 0, 0, strip)
+        if wnd.romanGroupKey[i] !== groupKey {
+            wnd.romanRanges[i] := RomanSegments.Group(parts, (charPos) => SendMessage(EM_LINEFROMCHAR, charPos, 0, strip))
+            wnd.romanGroupKey[i] := groupKey
+        }
+        return wnd.romanRanges[i]
+    }
+
+    ; A key or the mouse button released in a field or in its strip: the
+    ; other one shows the same segment (RomanSegments). Runs before the
+    ; control gets the message, when the key press or the click has already
+    ; put the caret and the selection where they are.
+    static SyncRomanSelection(wp, lp, msg, hwnd) {
+        if !(ctrl := GuiCtrlFromHwnd(hwnd)) || ctrl.Type != 'Edit' {
+            return
+        }
+        try wnd := ctrl.Gui
+        catch {
+            return
+        }
+        if !this.guis.Has(wnd.Hwnd) || !wnd.HasOwnProp('romanRanges') {
+            return
+        }
+        Loop 2 {
+            if ctrl == wnd.edit%A_Index% {
+                this.ShowSegmentInStrip(wnd, A_Index)
+                this.ShowSelectedPronunciation(wnd, A_Index)
+            } else if ctrl == wnd.roman%A_Index% {
+                this.ShowSegmentInField(wnd, A_Index)
+            }
+        }
+    }
+
+    ; The segments under the caret or the selection of a field, selected in
+    ; its strip, which scrolls to them; outside the segments (an empty line)
+    ; nothing is selected. Not while the font size hint replaces the text.
+    static ShowSegmentInStrip(wnd, i) {
+        static EM_SETSEL := 0xB1
+        ranges := this.RomanGroups(wnd, i)
+        if !ranges.Length || !wnd.romanVisible[i] || this.restoreTextExpected.Has(wnd.edit%i%.Hwnd) {
+            return
+        }
+        this.GetEditSelection(wnd.edit%i%, &selStart, &selEnd)
+        found := RomanSegments.Covered(ranges, selStart, selEnd, 'srcStart', 'srcEnd')
+        if !found.Length {
+            SendMessage(EM_SETSEL, -1, 0, wnd.roman%i%)
+            return
+        }
+        SendMessage(EM_SETSEL, found[1].romStart, found[-1].romEnd, wnd.roman%i%)
+        this.ScrollStripToRange(wnd.roman%i%, found[1].romStart, found[-1].romEnd,
+                                RomanSegments.RomanPosition(found[1], selStart))
+    }
+
+    ; The segments under the caret or the selection of a strip, selected in
+    ; its field, which scrolls to their start. The strip itself is left as
+    ; it is: in an Edit the selection carries the caret, and selecting the
+    ; segment there moved the caret to its end after every key (Up could not
+    ; leave a segment of several lines).
+    static ShowSegmentInField(wnd, i) {
+        static EM_SETSEL := 0xB1, EM_SCROLLCARET := 0xB7, EM_GETFIRSTVISIBLELINE := 0xCE
+        ranges := this.RomanGroups(wnd, i)
+        if !ranges.Length || this.restoreTextExpected.Has(wnd.edit%i%.Hwnd) {
+            return
+        }
+        this.GetEditSelection(wnd.roman%i%, &selStart, &selEnd)
+        found := RomanSegments.Covered(ranges, selStart, selEnd, 'romStart', 'romEnd')
+        if !found.Length {
+            return
+        }
+        topBefore := SendMessage(EM_GETFIRSTVISIBLELINE, 0, 0, wnd.edit%i%)
+        ; The caret goes to the second position given: the start of the
+        ; segment, which EM_SCROLLCARET then brings into view.
+        SendMessage(EM_SETSEL, found[-1].srcEnd, found[1].srcStart, wnd.edit%i%)
+        SendMessage(EM_SCROLLCARET, 0, 0, wnd.edit%i%)
+        ; A field that scrolls sends EN_VSCROLL for this scroll too, handled
+        ; later, as a new thread: OnFieldScroll would take the strip to the
+        ; segment at the top of the field, often the end of the one before.
+        this.KeepOwnTop(wnd, i, topBefore)
+    }
+
+    ; The field i was scrolled by the program: the top line it was left at
+    ; is not followed by the strip (ScrollStripToField) until the field is
+    ; scrolled to another one.
+    static KeepOwnTop(wnd, i, topBefore) {
+        static EM_GETFIRSTVISIBLELINE := 0xCE
+        topAfter := SendMessage(EM_GETFIRSTVISIBLELINE, 0, 0, wnd.edit%i%)
+        if topAfter != topBefore {
+            wnd.romanOwnTop[i] := topAfter
+        }
+    }
+
+    ; The field was scrolled (the wheel, the scroll bar): its strip follows,
+    ; to the place of the segment at the top of the field. EN_VSCROLL comes
+    ; before the field is redrawn, so the position is read after it. It comes
+    ; for a scroll by a message too: the scroll of ShowSegmentInField, at the
+    ; top line it left (romanOwnTop), is not followed.
+    static OnFieldScroll(wnd, i, *) {
+        SetTimer(ObjBindMethod(this, 'ScrollStripToField', wnd, i), -1)
+    }
+
+    static ScrollStripToField(wnd, i) {
+        static EM_LINEINDEX := 0xBB, EM_GETFIRSTVISIBLELINE := 0xCE
+        if !this.IsAlive(wnd) || !wnd.romanVisible[i] || this.restoreTextExpected.Has(wnd.edit%i%.Hwnd) {
+            return
+        }
+        topLine := SendMessage(EM_GETFIRSTVISIBLELINE, 0, 0, wnd.edit%i%)
+        ; Kept while the field stays there: the wheel over the strip scrolls
+        ; the field notch by notch (WheelOverStrip), and the EN_VSCROLL of a
+        ; notch may come after the next one has scrolled the field again.
+        if topLine == wnd.romanOwnTop[i] {
+            return
+        }
+        wnd.romanOwnTop[i] := -1
+        topChar := SendMessage(EM_LINEINDEX, topLine, 0, wnd.edit%i%)
+        for range in this.RomanGroups(wnd, i) {
+            if range.srcEnd > topChar {
+                this.ScrollStripToRange(wnd.roman%i%, range.romStart, range.romEnd,
+                                        RomanSegments.RomanPosition(range, topChar))
+                return
+            }
+        }
+    }
+
+    ; The wheel over a romanization strip (with Ctrl it is the font size,
+    ; WM_MOUSEWHEEL) moves it by one line a notch, whatever a notch scrolls
+    ; in Windows: the strip has two lines. With the focus in the strip a
+    ; notch is the Up or Down key: the caret moves, and the field selects
+    ; its segment as after the key. Without the focus the strip only
+    ; scrolls, and the field follows to the place of what it shows, its
+    ; selection left as it is (ScrollFieldToStrip). A fine wheel or a
+    ; touchpad sends parts of a notch: the rest waits for the next message
+    ; and is dropped when the direction changes.
+    static WheelOverStrip(ctrl, wp) {
+        static WM_KEYDOWN := 0x100, VK_UP := 0x26, VK_DOWN := 0x28, WHEEL_DELTA := 120
+             , EM_LINESCROLL := 0xB6, EM_GETFIRSTVISIBLELINE := 0xCE
+        if ctrl.Type != 'Edit' {
+            return
+        }
+        try wnd := ctrl.Gui
+        catch {
+            return
+        }
+        if !this.guis.Has(wnd.Hwnd) || !wnd.HasOwnProp('romanWheelRest') {
+            return
+        }
+        i := (ctrl == wnd.roman1) ? 1 : (ctrl == wnd.roman2) ? 2 : 0
+        if !i || !wnd.romanVisible[i] {
+            return
+        }
+        delta := wp >> 16 & 0xFFFF
+        if delta > 0x7FFF {
+            delta -= 0x10000
+        }
+        wheelRest := wnd.romanWheelRest[i]
+        if wheelRest < 0 && delta > 0 || wheelRest > 0 && delta < 0 {
+            wheelRest := 0
+        }
+        wheelRest += delta
+        steps := Integer(wheelRest / WHEEL_DELTA)   ; up when positive
+        wnd.romanWheelRest[i] := wheelRest - steps * WHEEL_DELTA
+        if !steps {
+            return 0
+        }
+        if this.HasFocus(ctrl) {
+            ; Sent: the control handles it at once, and WM_KEYUP, which
+            ; syncs the field after a key (SyncRomanSelection), does not come.
+            Loop Abs(steps) {
+                SendMessage(WM_KEYDOWN, steps > 0 ? VK_UP : VK_DOWN, 1, ctrl)
+            }
+            this.ShowSegmentInField(wnd, i)
+            return 0
+        }
+        topBefore := SendMessage(EM_GETFIRSTVISIBLELINE, 0, 0, ctrl)
+        SendMessage(EM_LINESCROLL, 0, -steps, ctrl)
+        if SendMessage(EM_GETFIRSTVISIBLELINE, 0, 0, ctrl) != topBefore {
+            this.ScrollFieldToStrip(wnd, i)
+        }
+        return 0
+    }
+
+    ; The strip scrolled without moving its caret (WheelOverStrip): the field
+    ; shows the text of its two lines, the places found by proportion
+    ; (RomanSegments.SourcePosition), the start first when they do not fit.
+    ; Nothing moves while it is in view, as the strip does for the field
+    ; (ScrollStripToRange); the selection of the field stays.
+    static ScrollFieldToStrip(wnd, i) {
+        static WM_GETTEXTLENGTH := 0xE, EM_LINEINDEX := 0xBB, EM_LINEFROMCHAR := 0xC9
+             , EM_GETFIRSTVISIBLELINE := 0xCE, STRIP_LINES := 2
+        ranges := this.RomanGroups(wnd, i)
+        if !ranges.Length || this.restoreTextExpected.Has(wnd.edit%i%.Hwnd) {
+            return
+        }
+        strip := wnd.roman%i%
+        stripTop := SendMessage(EM_GETFIRSTVISIBLELINE, 0, 0, strip)
+        startChar := SendMessage(EM_LINEINDEX, stripTop, 0, strip)
+        endChar := SendMessage(EM_LINEINDEX, stripTop + STRIP_LINES, 0, strip)
+        if endChar < 0 {
+            endChar := SendMessage(WM_GETTEXTLENGTH, 0, 0, strip)
+        }
+        firstRange := lastRange := ''
+        for range in ranges {
+            if range.romEnd > startChar && range.romStart < endChar {
+                (IsObject(firstRange) || firstRange := range)
+                lastRange := range
+            }
+        }
+        if !IsObject(firstRange) {
+            return
+        }
+        srcFirst := RomanSegments.SourcePosition(firstRange, Max(startChar, firstRange.romStart))
+        srcLast := RomanSegments.SourcePosition(lastRange, Min(endChar, lastRange.romEnd) - 1)
+        field := wnd.edit%i%
+        topBefore := SendMessage(EM_GETFIRSTVISIBLELINE, 0, 0, field)
+        this.ScrollEditToLines(field, SendMessage(EM_LINEFROMCHAR, srcFirst, 0, field),
+                               SendMessage(EM_LINEFROMCHAR, Max(srcFirst, srcLast), 0, field))
+        ; Its EN_VSCROLL would take the strip to the segment at the top.
+        this.KeepOwnTop(wnd, i, topBefore)
+    }
+
+    ; Scrolls a multi-line Edit as little as needed to show its lines from
+    ; firstLine to lastLine, firstLine kept in view when they do not fit.
+    static ScrollEditToLines(editCtrl, firstLine, lastLine) {
+        static EM_GETRECT := 0xB2, EM_LINESCROLL := 0xB6, EM_GETLINECOUNT := 0xBA
+             , EM_LINEINDEX := 0xBB, EM_GETFIRSTVISIBLELINE := 0xCE, EM_POSFROMCHAR := 0xD6
+        topLine := SendMessage(EM_GETFIRSTVISIBLELINE, 0, 0, editCtrl)
+        if firstLine < topLine {
+            SendMessage(EM_LINESCROLL, 0, firstLine - topLine, editCtrl)
+            return
+        }
+        if lastLine <= topLine || topLine + 1 >= SendMessage(EM_GETLINECOUNT, 0, 0, editCtrl) {
+            return
+        }
+        ; The height of a line and the lines in view, from the places of the
+        ; top line and the one under it.
+        topPos := SendMessage(EM_POSFROMCHAR, SendMessage(EM_LINEINDEX, topLine, 0, editCtrl), 0, editCtrl)
+        nextPos := SendMessage(EM_POSFROMCHAR, SendMessage(EM_LINEINDEX, topLine + 1, 0, editCtrl), 0, editCtrl)
+        if (topPos & 0xFFFFFFFF) == 0xFFFFFFFF || (nextPos & 0xFFFFFFFF) == 0xFFFFFFFF {
+            return
+        }
+        topY := topPos >> 16 & 0xFFFF
+        nextY := nextPos >> 16 & 0xFFFF
+        if topY > 0x7FFF {
+            topY -= 0x10000
+        }
+        if nextY > 0x7FFF {
+            nextY -= 0x10000
+        }
+        lineH := nextY - topY
+        if lineH <= 0 {
+            return
+        }
+        formatRect := Buffer(16, 0)
+        SendMessage(EM_GETRECT, 0, formatRect, editCtrl)
+        lastVisible := topLine + Max(1, (NumGet(formatRect, 12, 'Int') - topY) // lineH) - 1
+        if lastLine > lastVisible {
+            SendMessage(EM_LINESCROLL, 0, Min(lastLine - lastVisible, firstLine - topLine), editCtrl)
+        }
+    }
+
+    ; Scrolls a strip (two lines, RomanStripHeight) to a range. A range that
+    ; fits is shown whole. A longer one is shown around focusPos, the place
+    ; matching the caret: its line becomes the lower of the two, so the line
+    ; before it is seen too (the place is found by proportion and may be a
+    ; line off). Nothing moves while what is needed is in view.
+    static ScrollStripToRange(strip, rangeStart, rangeEnd, focusPos) {
+        static EM_LINESCROLL := 0xB6, EM_LINEFROMCHAR := 0xC9, EM_GETFIRSTVISIBLELINE := 0xCE
+             , STRIP_LINES := 2
+        firstLine := SendMessage(EM_LINEFROMCHAR, rangeStart, 0, strip)
+        lastLine := SendMessage(EM_LINEFROMCHAR, Max(rangeStart, rangeEnd - 1), 0, strip)
+        topLine := SendMessage(EM_GETFIRSTVISIBLELINE, 0, 0, strip)
+        if lastLine - firstLine < STRIP_LINES {
+            if firstLine >= topLine && lastLine < topLine + STRIP_LINES {
+                return
+            }
+            newTopLine := firstLine
+        } else {
+            focusLine := SendMessage(EM_LINEFROMCHAR, focusPos, 0, strip)
+            if focusLine >= topLine && focusLine < topLine + STRIP_LINES {
+                return
+            }
+            newTopLine := Max(firstLine, focusLine - 1)
+        }
+        SendMessage(EM_LINESCROLL, 0, newTopLine - topLine, strip)
+    }
+
+    ; The text of an Edit control as it holds it, with its own line breaks
+    ; (`r`n, `n or both), so that positions in it are those of its messages.
+    static GetRawText(ctrl) {
+        static WM_GETTEXT := 0xD, WM_GETTEXTLENGTH := 0xE
+        textLen := SendMessage(WM_GETTEXTLENGTH, 0, 0, ctrl)
+        textBuf := Buffer((textLen + 1) * 2, 0)
+        textLen := SendMessage(WM_GETTEXT, textLen + 1, textBuf, ctrl)
+        return StrGet(textBuf, textLen)
+    }
+
+    ; The bounds of the selection of an Edit control (equal for a caret).
+    static GetEditSelection(ctrl, &selStart, &selEnd) {
+        static EM_GETSEL := 0xB0
+        startBuf := Buffer(4, 0), endBuf := Buffer(4, 0)
+        SendMessage(EM_GETSEL, startBuf, endBuf, ctrl)
+        selStart := NumGet(startBuf, 'UInt')
+        selEnd := NumGet(endBuf, 'UInt')
     }
 
     ; The Change event comes for the text the program puts into a field too,
@@ -3066,6 +3946,140 @@ class TranslateWindow
         if wnd.edit%i%.Text != wnd.romanSource[i] {
             this.ClearRomanization(wnd, i)
         }
+        ; The pronunciation of the main word goes when the word changes (the
+        ; Change event of the text the program put comes later and leaves it).
+        if wnd.pronAutoWord[i] != '' && this.MainWord(wnd, i) !== wnd.pronAutoWord[i] {
+            wnd.pronAuto[i] := ''
+            wnd.pronAutoWord[i] := ''
+            (wnd.pronWord[i] == '' && this.ShowPronunciation(wnd, i, ''))
+        }
+    }
+
+    ; The word whose pronunciation a field shows by itself: the text of the
+    ; top field, the main translation of the bottom one (before the blank
+    ; line and the variants), as PronunciationWord gives it; a pronunciation
+    ; is asked for only if it is one word (GoogleTranslator.IsPronounceable).
+    static MainWord(wnd, i) {
+        fieldText := StrReplace(wnd.edit%i%.Text, '`r`n', '`n')
+        (i == 2 && fieldText := StrSplit(fieldText, '`n`n')[1])
+        return this.PronunciationWord(fieldText)
+    }
+
+    ; A text without what is not letters at its ends: a double click in an
+    ; Edit breaks words only at spaces and selects "home," or "«home»" with
+    ; the marks; an apostrophe or a hyphen inside ("don't") stays.
+    static PronunciationWord(text) => RegExReplace(text, '^[^\p{L}]+|[^\p{L}]+$')
+
+    ; Shows text (a pronunciation) in the button row of field i, or hides
+    ; the place when it is empty.
+    static ShowPronunciation(wnd, i, pronText) {
+        if wnd.pron%i%.Value !== pronText {
+            wnd.pron%i%.Value := pronText
+        }
+        wnd.pron%i%.Visible := pronText != ''
+    }
+
+    ; A new translation: no pronunciation until it is asked for again.
+    static ResetPronunciation(wnd) {
+        if !wnd.HasOwnProp('pron1') {
+            return
+        }
+        Loop 2 {
+            SetTimer wnd.pronWaitTimers[A_Index], 0
+            wnd.pronAuto[A_Index] := ''
+            wnd.pronAutoWord[A_Index] := ''
+            wnd.pronWord[A_Index] := ''
+            this.ShowPronunciation(wnd, A_Index, '')
+        }
+    }
+
+    ; The pronunciation of the main word of each field (MainWord), in square
+    ; brackets, asked for after the translation is shown. A word selected in
+    ; the meantime keeps its own.
+    static FillPronunciation(wnd) {
+        Loop 2 {
+            i := A_Index
+            if !this.IsAlive(wnd) || !GoogleTranslator.showPronun {
+                return
+            }
+            word := this.MainWord(wnd, i)
+            lang := this.LangNameToCode(wnd.lng%i%.Text)
+            if !GoogleTranslator.IsPronounceable(word, lang) {
+                continue
+            }
+            pron := (this.pronouncer)(word, lang)
+            if !this.IsAlive(wnd) || this.MainWord(wnd, i) !== word || pron == '' {
+                continue
+            }
+            wnd.pronAutoWord[i] := word
+            wnd.pronAuto[i] := '[' . pron . ']'
+            (wnd.pronWord[i] == '' && this.ShowPronunciation(wnd, i, wnd.pronAuto[i]))
+        }
+    }
+
+    ; One word selected in a field (a double click selects one): its
+    ; pronunciation, with the word, in place of that of the main word; when
+    ; no such word is selected, the main word's comes back. The request runs
+    ; later, by a timer: it must not hold the message being handled. While
+    ; it runs, dots follow the word, as in the field while a translation is
+    ; awaited; they come after 300 ms, so an answer from the cache does not
+    ; flash them. The user asked, so an answer is always shown: [—] when the
+    ; word has none, [?] when Google did not answer. (The main word stays
+    ; silent: nobody asked for it.)
+    static ShowSelectedPronunciation(wnd, i) {
+        if !GoogleTranslator.showPronun || !wnd.HasOwnProp('pron1') {
+            return
+        }
+        selected := this.PronunciationWord(EditGetSelectedText(wnd.edit%i%))
+        lang := this.LangNameToCode(wnd.lng%i%.Text)
+        if !GoogleTranslator.IsPronounceable(selected, lang) {
+            if wnd.pronWord[i] != '' {
+                SetTimer wnd.pronWaitTimers[i], 0
+                wnd.pronWord[i] := ''
+                this.ShowPronunciation(wnd, i, wnd.pronAuto[i])
+            }
+            return
+        }
+        if selected == wnd.pronWord[i] {
+            return
+        }
+        wnd.pronWord[i] := selected
+        wnd.pronDots[i] := 0
+        SetTimer wnd.pronWaitTimers[i], 300
+        SetTimer(ObjBindMethod(this, 'FillSelectedPronunciation', wnd, i, selected, lang), -1)
+    }
+
+    static FillSelectedPronunciation(wnd, i, word, lang) {
+        pron := (this.pronouncer)(word, lang)
+        ; Another word may have been selected while the request was running:
+        ; its own request shows it, and stops the dots.
+        if !this.IsAlive(wnd) || wnd.pronWord[i] !== word {
+            return
+        }
+        SetTimer wnd.pronWaitTimers[i], 0
+        this.ShowPronunciation(wnd, i, word . ' [' . (pron != '' ? pron : GoogleTranslator.pronounceFailed ? '?' : '—') . ']')
+    }
+
+    static WaitForPronunciation(wnd, i) {
+        if !this.IsAlive(wnd) || wnd.pronWord[i] == '' {
+            SetTimer , 0
+            return
+        }
+        wnd.pronDots[i] := Mod(wnd.pronDots[i], 3) + 1
+        this.ShowPronunciation(wnd, i, wnd.pronWord[i] . ' ' . SubStr('...', 1, wnd.pronDots[i]))
+    }
+
+    ; Show Pronunciation turned on or off: the open windows follow at once.
+    static OnPronunciationToggled() {
+        for hwnd, wnd in this.guis {
+            if !wnd.HasOwnProp('pron1') {
+                continue
+            }
+            this.ResetPronunciation(wnd)
+            if GoogleTranslator.showPronun && wnd.edit2.Text != '' {
+                SetTimer(ObjBindMethod(this, 'FillPronunciation', wnd), -1)
+            }
+        }
     }
 
     ; Clears the romanization of a field, or of both. The strip stays: it
@@ -3075,9 +4089,15 @@ class TranslateWindow
             return
         }
         for fieldNum in (i ? [i] : [1, 2]) {
+            wnd.romanParts[fieldNum] := []
+            wnd.romanRanges[fieldNum] := []
+            wnd.romanGroupKey[fieldNum] := ''
+            if wnd.HasOwnProp('romanWheelRest') {
+                wnd.romanOwnTop[fieldNum] := -1
+                wnd.romanWheelRest[fieldNum] := 0
+            }
             if wnd.roman%fieldNum%.Value != '' {
                 wnd.roman%fieldNum%.Value := ''
-                try wnd.buttonHints.SetText(wnd.roman%fieldNum%, '')
             }
         }
     }
@@ -3389,8 +4409,17 @@ class TranslateWindow
                     this.MoveIfChanged(wnd.%ctrl . i%, wnd.coords[ctrl . i].x + (width > wnd.coords['center'] * 2 ? center - wnd.coords['center'] : 0))
                 }
                 this.MoveIfChanged(wnd.edit%i%,,, width - wnd.MarginX * 2)
-                this.MoveIfChanged(wnd.trans%i%, width - wnd.MarginX - wnd.coords['trans' . i].w + 1)
-                (wnd.HasOwnProp('roman1') && this.MoveIfChanged(wnd.roman%i%,,, width - wnd.MarginX * 2))
+                transX := width - wnd.MarginX - wnd.coords['trans' . i].w + 1
+                this.MoveIfChanged(wnd.trans%i%, transX)
+                if wnd.HasOwnProp('roman1') {
+                    this.MoveIfChanged(wnd.roman%i%,,, width - wnd.MarginX * 2)
+                    this.PadText(wnd.roman%i%, this.ROMAN_PAD_X, this.ROMAN_PAD_Y)
+                }
+                ; The pronunciation ends where the translate button begins.
+                if wnd.HasOwnProp('pron1') {
+                    this.MoveIfChanged(wnd.pron%i%,,, Max(0, transX - this.PRON_GAP - wnd.coords['pron' . i].x))
+                    this.PadText(wnd.pron%i%, this.PRON_PAD_X, wnd.pronPadY)
+                }
             }
         }
     }
@@ -3445,12 +4474,12 @@ class TranslateWindow
 
         this.PlaceControl(wnd.edit1, coords['edit1'].y, edit1H)
         hasRoman := wnd.HasOwnProp('roman1')
-        for ctrl in (hasRoman ? ['txt2', 'lng2', 'swapLang2', 'roman1', 'play1', 'stop1', 'trans1']
-                              : ['txt2', 'lng2', 'swapLang2', 'play1', 'stop1', 'trans1']) {
+        for ctrl in (hasRoman ? ['txt2', 'lng2', 'swapLang2', 'roman1', 'play1', 'stop1', 'pron1', 'trans1']
+                              : ['txt2', 'lng2', 'swapLang2', 'play1', 'stop1', 'pron1', 'trans1']) {
             this.PlaceControl(wnd.%ctrl%, coords[ctrl].y + middleShift)
         }
         this.PlaceControl(wnd.edit2, coords['edit2'].y + middleShift, edit2H)
-        for ctrl in (hasRoman ? ['roman2', 'play2', 'stop2', 'trans2'] : ['play2', 'stop2', 'trans2']) {
+        for ctrl in (hasRoman ? ['roman2', 'play2', 'stop2', 'pron2', 'trans2'] : ['play2', 'stop2', 'pron2', 'trans2']) {
             this.PlaceControl(wnd.%ctrl%, coords[ctrl].y + bottomShift)
         }
         ; Moved in DPI-scaled units, the lower list may be a pixel off its button.
@@ -3582,6 +4611,7 @@ class TranslateWindow
             for ctrl in ['play2', 'stop2', 'trans2'] {
                 this.MoveIfChanged(params.wnd.%ctrl%,, height - 32)
             }
+            (params.wnd.HasOwnProp('pron2') && this.MoveIfChanged(params.wnd.pron2,, height - 32 + params.wnd.pronOffsetY))
             this.RepaintBackground(params.wnd)
         }
     }
@@ -5607,8 +6637,10 @@ class TranslationCache {
         return TranslationCache.TYPE_TRANSLATION . this._Hash(source)
     }
 
+    ; '|parts': the romanization is kept in parts (RomanSegments). Records of
+    ; the older whole-text form are not found and age out of the cache.
     _MakeRomanKey(text, sl) {
-        source := text . '|' . sl
+        source := text . '|' . sl . '|parts'
         return TranslationCache.TYPE_ROMAN . this._Hash(source)
     }
 
@@ -7008,7 +8040,7 @@ class ButtonToolTips
                'Int', horizontalMargin, 'Int', verticalMargin, marginRect)
         SendMessage(TTM_SETMARGIN, 0, marginRect, this.hwnd)
         SendMessage(TTM_SETDELAYTIME, TTDT_AUTOPOP, ButtonToolTips.AUTOPOP_MS, this.hwnd)
-        ; A long text (the romanization of a field) wraps and keeps its line breaks.
+        ; A long text wraps and keeps its line breaks.
         SendMessage(TTM_SETMAXTIPWIDTH, 0, Round(ButtonToolTips.MAX_WIDTH * A_ScreenDPI / 96), this.hwnd)
         this.ApplyTheme(darkMode)
     }
@@ -7489,7 +8521,7 @@ class Icons
 class Config {
     ; Keep in sync with ;@Ahk2Exe-SetVersion at the top of the script:
     ; Tools\BuildRelease.ps1 refuses to build when they differ.
-    static VERSION := '1.2.1'
+    static VERSION := '1.3.0'
 
     ; Public keys built into Google's own browser-side clients (Google Translate
     ; website translation and the Google Dictionary extension). They are not the

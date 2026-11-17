@@ -27,11 +27,29 @@ When translating selected text, the program tries to determine which language in
 
 ## Translator window
 
-In the top field, you can type or paste the source text, select the source and target languages, then click the translate button or press `Enter`. If a fragment is selected in the field, that fragment is translated. To insert a line break, press `Shift+Enter`.
+In the top field, you can type or paste the source text, select the source and target languages, then click the translate button or press `Enter`. To insert a line break, press `Shift+Enter`.
 
 The reverse translation button translates text from the bottom field in the opposite direction. Pressing `Enter` in the bottom field does the same. The buttons next to the language lists swap the source and target languages; `Ctrl+Tab` in the translator window does the same. When the source language is detected automatically, there is nothing to swap, and a notice says so. Pointing to a button shows a tooltip in your native language.
 
+If a fragment of text is selected in a field, translation and speech for that field use only the fragment: the translate button (or `Enter`) translates it and the play button speaks it, not the whole text. This way you can, for example, translate one sentence of a long text or hear one of the translation variants.
+
 You can resize the window with the mouse: dragging the top edge enlarges the top text field, while dragging the bottom edge enlarges the bottom field. When the window is taller than its minimum height, that is, when at least one field has been enlarged, you can also change the ratio of the fields without changing the window height: drag the bottom edge of the top field or the top edge of the bottom one. After a translation, the bottom field grows to fit it, unless `Remember Window Size` is turned on in the `Options` submenu of the tray menu. To change the font size of an individual field, point to it, hold `Ctrl`, and scroll the mouse wheel.
+
+### Romanization
+
+When `Options` → `Show Romanization` is on, a strip with the romanization of text in a non-Latin script appears under its field: pinyin for Chinese, romaji for Japanese, transliteration for Cyrillic, and so on. The strip has a tinted background, shows two lines, and uses the font size of the field; its line breaks follow those of the text.
+
+The romanization is linked to the text. Clicking or selecting in the field highlights the matching part of the romanization and scrolls the strip to it, and scrolling the field with the mouse wheel scrolls the strip as well. Clicking in the strip, in turn, selects the matching part of the text in the field. The mouse wheel over the strip scrolls it one line at a time, and the field scrolls to the matching text. When the strip has the focus (after a click in it), the wheel works like the Up and Down arrow keys: it moves the cursor line by line and also selects the matching part of the text. The parts are sentences; a long sentence is divided at punctuation marks into pieces that fit the strip, and the division adapts when the window width changes. If Google returns a romanization that cannot be matched to the text, it is shown without this link.
+
+The romanization comes from a separate Google service. If it does not answer for a while, for example because of frequent requests, no new romanization appears, but romanizations already received are still taken from the cache; the program tries again in about two minutes. Translation does not depend on it.
+
+### Pronunciation
+
+When `Options` → `Show Pronunciation` is on, the button row of a field, between the stop button and the translate button, shows the dictionary pronunciation of a word, for example `[ˈwôdər]` for *water*. Google provides it only for single words in English, Italian, and German, and not for every word.
+
+After a translation, the pronunciation of the field's text is shown if it is a single word; for the bottom field, that of the main translation, without the list of variants. To see the pronunciation of another word, such as one of the translation variants or a word in a phrase, double-click it: the word and its pronunciation appear. While the answer is awaited, dots run after the word. `[—]` means that Google has no pronunciation for the word, and `[?]` means that Google did not answer; try again later. When the selection is removed, the pronunciation of the field's main word is shown again.
+
+This is the notation of Google's dictionaries, not the International Phonetic Alphabet (IPA). In English, capitalized letter pairs such as `TH`, `SH`, and `NG` stand for single sounds; in Italian, the word is divided into syllables with the stress marked (`cà·sa`); in German, only the stress is marked (`Haús`).
 
 ## Tray menu
 
@@ -47,9 +65,10 @@ Right-click the program's tray icon to open the settings menu. The on/off settin
 | `Options` → `Copy Main Translation` | Automatically copy the main translation to the clipboard |
 | `Options` → `Remember Window Size` | Keep the window width and the heights of both text fields: new windows open with this size, and a translation does not resize the window |
 | `Options` → `Switch Keyboard Layout` | When a text field gets the focus, switch the keyboard layout to the language of that field, if such a layout is installed. If Windows uses one layout for all windows, the previous layout is restored when you leave the translator window. In the language lists the layout of the native language is used, as the language names are in it. On by default |
-| `Options` → `Show Romanization` | Show the romanization of text in a non-Latin script (pinyin, romaji, transliterated Cyrillic) in a strip under its text field, in the font size of the field. The strip appears only for such text; a long romanization scrolls, and hovering over the strip shows all of it. It comes from a separate Google service: if Google does not answer it, only the romanization is missing, not the translation. Off by default |
+| `Options` → `Show Romanization` | Show the romanization of text in a non-Latin script in a strip under its text field (see “Romanization”). Off by default |
+| `Options` → `Show Pronunciation` | Show the dictionary pronunciation of single English, Italian, and German words in the button row of a field (see “Pronunciation”). Off by default |
 | `Add To Startup` | Enable or disable starting the program with Windows |
-| `Clear Cache` | Clear cached translations and speech |
+| `Clear Cache` | Clear cached translations, speech, romanizations, and pronunciations |
 
 Double-clicking the icon runs `Open GUI`. The menu also provides commands for opening the script folder, reloading the program, and exiting. When the source `.ahk` file is running, the `Edit This Script` command is also shown.
 
@@ -64,11 +83,11 @@ Double-clicking the icon runs `Open GUI`. The menu also provides commands for op
 
 ## Cache
 
-Translations and speech are stored in a cache on disk and remain available after the program restarts. When the cache fills up, the oldest entries are replaced. Its size is limited to 100 MB by default; you can change this value with `Cache Size MB` in `settings.ini`. Use `Clear Cache` in the tray menu to clear it.
+Translations, speech, romanizations, and pronunciations are stored in a cache on disk and remain available after the program restarts. When the cache fills up, the oldest entries are replaced. Its size is limited to 100 MB by default; you can change this value with `Cache Size MB` in `settings.ini`. Use `Clear Cache` in the tray menu to clear it.
 
 ## Speech
 
-The playback buttons next to the text fields let you hear the source text or translation, pause playback, and stop it. For individual English words, Oxford dictionary pronunciation is used when available; Google TTS is used otherwise.
+The playback buttons next to the text fields let you hear the source text or translation, pause playback, and stop it. If a fragment of text is selected in a field, only that fragment is spoken. For individual English words, Oxford dictionary pronunciation is used when available; Google TTS is used otherwise.
 
 Speech playback uses Windows Media Foundation components. Windows N/KN editions may require the Media Feature Pack.
 
