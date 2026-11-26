@@ -29,7 +29,9 @@ When translating selected text, the program tries to determine which language in
 
 In the top field, you can type or paste the source text, select the source and target languages, then click the translate button or press `Enter`. To insert a line break, press `Shift+Enter`.
 
-The reverse translation button translates text from the bottom field in the opposite direction. Pressing `Enter` in the bottom field does the same. The buttons next to the language lists swap the source and target languages; `Ctrl+Tab` in the translator window does the same. When the source language is detected automatically, there is nothing to swap, and a notice says so. Pointing to a button shows a tooltip in your native language.
+The reverse translation button translates text from the bottom field in the opposite direction. Pressing `Enter` in the bottom field does the same. The buttons next to the language lists swap the source and target languages; `Ctrl+Tab` in the translator window does the same. When the source list is set to “Detect language” and no language has been detected yet, there is nothing to swap, and a notice says so. Pointing to a button shows a tooltip in your native language.
+
+When the source language is detected automatically (when translating with `Ctrl+C+C`, or when “Detect language” is selected in the list), the list shows the language found, and the label to its left changes to “Detected Language”. Such a language is only shown: a new text translated from the window is detected anew. To keep the language for the following translations from the window, select it in the list, even if it is already shown: the label changes back to “Source Language”. A tooltip on the label says so. When the program itself changes the language of a row, for example detection found another language, the label of that row briefly lights up.
 
 If a fragment of text is selected in a field, translation and speech for that field use only the fragment: the translate button (or `Enter`) translates it and the play button speaks it, not the whole text. This way you can, for example, translate one sentence of a long text or hear one of the translation variants.
 
@@ -51,6 +53,12 @@ After a translation, the pronunciation of the field's text is shown if it is a s
 
 This is the notation of Google's dictionaries, not the International Phonetic Alphabet (IPA). In English, capitalized letter pairs such as `TH`, `SH`, and `NG` stand for single sounds; in Italian, the word is divided into syllables with the stress marked (`cà·sa`); in German, only the stress is marked (`Haús`).
 
+### Articles
+
+When `Options` → `Show Articles` is on and a single word is translated into German, Italian, Spanish, French, or Portuguese, the nouns among the translation variants are shown with their articles: `der Tisch`, `la mesa`, `l'école`. If the article of the main translation is known, that word with its article comes first among the variants; the main translation itself stays without an article, so it is copied and pasted as before.
+
+The articles come from Google's dictionary and appear shortly after the translation; if Google does not answer, the variants are shown without them. Not every word has a known article: for example, the main translation may be missing from Google's dictionary. Occasionally Google's articles are wrong.
+
 ## Tray menu
 
 Right-click the program's tray icon to open the settings menu. The on/off settings, except `Windowless Mode`, are in the `Options` submenu. The main commands are:
@@ -67,8 +75,9 @@ Right-click the program's tray icon to open the settings menu. The on/off settin
 | `Options` → `Switch Keyboard Layout` | When a text field gets the focus, switch the keyboard layout to the language of that field, if such a layout is installed. If Windows uses one layout for all windows, the previous layout is restored when you leave the translator window. In the language lists the layout of the native language is used, as the language names are in it. On by default |
 | `Options` → `Show Romanization` | Show the romanization of text in a non-Latin script in a strip under its text field (see “Romanization”). Off by default |
 | `Options` → `Show Pronunciation` | Show the dictionary pronunciation of single English, Italian, and German words in the button row of a field (see “Pronunciation”). Off by default |
+| `Options` → `Show Articles` | Show the articles of nouns among the translation variants in German, Italian, Spanish, French, and Portuguese (see “Articles”). Off by default |
 | `Add To Startup` | Enable or disable starting the program with Windows |
-| `Clear Cache` | Clear cached translations, speech, romanizations, and pronunciations |
+| `Clear Cache` | Clear cached translations, speech, romanizations, pronunciations, and articles |
 
 Double-clicking the icon runs `Open GUI`. The menu also provides commands for opening the script folder, reloading the program, and exiting. When the source `.ahk` file is running, the `Edit This Script` command is also shown.
 
@@ -83,7 +92,7 @@ Double-clicking the icon runs `Open GUI`. The menu also provides commands for op
 
 ## Cache
 
-Translations, speech, romanizations, and pronunciations are stored in a cache on disk and remain available after the program restarts. When the cache fills up, the oldest entries are replaced. Its size is limited to 100 MB by default; you can change this value with `Cache Size MB` in `settings.ini`. Use `Clear Cache` in the tray menu to clear it.
+Translations, speech, romanizations, pronunciations, and articles are stored in a cache on disk and remain available after the program restarts. When the cache fills up, the oldest entries are replaced. Its size is limited to 100 MB by default; you can change this value with `Cache Size MB` in `settings.ini`. Use `Clear Cache` in the tray menu to clear it.
 
 ## Speech
 

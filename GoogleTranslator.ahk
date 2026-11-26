@@ -2,7 +2,7 @@
 #SingleInstance Force
 ;@Ahk2Exe-SetName GoogleTranslator
 ;@Ahk2Exe-SetDescription Google Translate client for Windows
-;@Ahk2Exe-SetVersion 1.3.0
+;@Ahk2Exe-SetVersion 1.4.0
 ;@Ahk2Exe-SetOrigFilename GoogleTranslator.exe
 ; The base path is relative to the compiler folder (AutoHotkey\Compiler).
 ;@Ahk2Exe-Base ..\v2\AutoHotkey64.exe
@@ -860,6 +860,9 @@ class GoogleTranslator
         sl := languageSelection.sourceLanguage
         tl := languageSelection.targetLanguage
         directionSide := languageSelection.directionSide
+        ; The window marks a source language found by detection: it is only
+        ; shown, and the next text is detected anew (TranslateFromGui).
+        slWasAuto := sl == 'auto'
         
         ; Check the cache
         cached := ''
@@ -877,7 +880,7 @@ class GoogleTranslator
         }
         if cached != '' {
             this.ShowTranslation(text, cached.trans, foundSl, tl, cached.variants, wnd,
-                                 requestText, comment)
+                                 requestText, comment, slWasAuto)
             return
         }
         
@@ -923,7 +926,7 @@ class GoogleTranslator
             return
         }
         this.ShowTranslation(text, translation, sl, tl, res.Has('variants') ? res['variants'] : '',
-                             wnd, requestText, comment)
+                             wnd, requestText, comment, slWasAuto)
     }
 
     static ResolveTranslationLanguages(text, tl := '', sl := 'auto') {
@@ -1025,7 +1028,8 @@ class GoogleTranslator
             { key: 'switchLayout', iniKey: 'Switch Keyboard Layout'         , trayMenuItem: 'Switch Keyboard Layout',
               defaultValue: 1 },
             { key: 'showRoman', iniKey: 'Show Romanization'                 , trayMenuItem: 'Show Romanization'     },
-            { key: 'showPronun', iniKey: 'Show Pronunciation'               , trayMenuItem: 'Show Pronunciation'    }
+            { key: 'showPronun', iniKey: 'Show Pronunciation'               , trayMenuItem: 'Show Pronunciation'    },
+            { key: 'showArticles', iniKey: 'Show Articles'                  , trayMenuItem: 'Show Articles'         }
         ]
         for i, item in this.settings {
             this.%item.key% := IniRead(this.iniPath, 'Settings', item.iniKey,
@@ -1381,6 +1385,7 @@ class GoogleTranslator
                 (i == 'Remember Window Size' && this.rememberSize && TranslateWindow.SaveWindowSize(TranslateWindow.lastGui)),
                 (i == 'Show Romanization' && TranslateWindow.OnRomanizationToggled()),
                 (i == 'Show Pronunciation' && TranslateWindow.OnPronunciationToggled()),
+                (i == 'Show Articles' && TranslateWindow.OnArticlesToggled()),
                 IniWrite(this.%s.key%, this.iniPath, 'Settings', s.iniKey)
             )).Bind(s))
             (this.%s.key% && settingMenu.Check(s.trayMenuItem))
@@ -1411,6 +1416,7 @@ class GoogleTranslator
         ClearCache(*) {
             this.cache.Clear()
             this.romanSessionCache.Clear()
+            this.articleSessionCache.Clear()
         }
 
         AddToStartup(i, p, m) {
@@ -1442,7 +1448,7 @@ class GoogleTranslator
     ; from the displayed one (see LineUnwrapper). The cache keeps the
     ; translation without the comment marker, so it is put back here.
     static ShowTranslation(text, trans, sl, tl, variants := '', wnd := '', cacheText := '',
-                           comment := '') {
+                           comment := '', slDetected := false) {
         (cacheText == '' && cacheText := text)
         trans := LineUnwrapper.AlignLines(cacheText, trans)
         if trans !== '' && !this.cache.HasTranslation(cacheText, sl, tl) {
@@ -1468,8 +1474,13 @@ class GoogleTranslator
         if this.copyTrans {
             A_Clipboard := trans
         }
+        ; The variants of a word may get the articles of their nouns (Show
+        ; Articles): the window keeps what they are for.
+        articleSource := variants != '' && this.ARTICLE_LANGS.Has(tl)
+            ? {text: cacheText, sl: sl, tl: tl, main: trans, variants: variants} : ''
         (variants && trans .= '`r`n`r`n' . variants)
-        return TranslateWindow.ShowTranslation(sl, tl, text, trans, wnd ? wnd : this.multiGUI)
+        return TranslateWindow.ShowTranslation(sl, tl, text, trans, wnd ? wnd : this.multiGUI, slDetected,
+                                               articleSource)
     }
 
     ; The window and the control that have the keyboard focus.
@@ -1800,6 +1811,121 @@ class GoogleTranslator
         return ''
     }
 
+    ; The articles of the nouns among the dictionary variants of a word
+    ; translated into one of ARTICLE_LANGS (Show Articles): a Map of the
+    ; variant ("Tisch") to its article ("der"). The dictionary the
+    ; translation comes from (dictionaryExtensionData) has none; dt=bd of
+    ; translate_a/single gives them as previous_word (checked 2026-11-23 for
+    ; de, it, es, fr, pt; pl and nl have none). That is the endpoint of the
+    ; romanization: the same endpoints in turn, the same limit and blocks,
+    ; and the translation does not depend on it. Google's articles are
+    ; mostly right but not always (ru->de "стол" gave "der Tafel"). Answers
+    ; are kept for the session, found articles also on disk; errors are not
+    ; kept.
+    static ARTICLE_LANGS := Map('de', true, 'it', true, 'es', true, 'fr', true, 'pt', true)
+         , articleSessionCache := Map()   ; in front of the disk cache, emptied by Clear Cache
+         , ARTICLE_SESSION_MAX := 200
+
+    ; The articles kept for a word, without asking Google: a Map, empty if
+    ; none are kept (found is true for a kept answer without nouns too).
+    static CachedArticles(text, sl, tl, &found := false) {
+        cacheKey := sl . '|' . tl . '|' . text
+        if this.articleSessionCache.Has(cacheKey) {
+            found := true
+            return this.ArticlesFromString(this.articleSessionCache[cacheKey])
+        }
+        storedArticles := ''
+        try storedArticles := this.cache.GetArticles(text, sl, tl)
+        found := storedArticles != ''
+        if found {
+            (this.articleSessionCache.Count >= this.ARTICLE_SESSION_MAX && this.articleSessionCache.Clear())
+            this.articleSessionCache[cacheKey] := storedArticles
+        }
+        return this.ArticlesFromString(storedArticles)
+    }
+
+    static Articles(text, sl, tl) {
+        text := Trim(text, ' `t`r`n')
+        if text == '' || !this.ARTICLE_LANGS.Has(tl) {
+            return Map()
+        }
+        articleMap := this.CachedArticles(text, sl, tl, &found)
+        if found || this.IsRomanizationBlocked() {
+            return articleMap
+        }
+        return this.FetchArticles(text, sl, tl)
+    }
+
+    static FetchArticles(text, sl, tl) {
+        static hdrs := Map(
+                  'User-Agent'  , 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                                . 'AppleWebKit/537.36 (KHTML, like Gecko) '
+                                . 'Chrome/138.0.0.0 Safari/537.36',
+                  'Content-Type', 'application/x-www-form-urlencoded;charset=UTF-8'
+               )
+        for endpointIndex in this.RomanEndpointOrder() {
+            if A_TickCount < this.romanBlockedUntil[endpointIndex] {
+                continue
+            }
+            endpoint := StrReplace(this.ROMAN_ENDPOINTS[endpointIndex], 'dt=rm', 'dt=bd&dj=1')
+            this.WaitRomanSlot()
+            try {
+                res := this.wr.Fetch(endpoint . '&sl=' . sl . '&tl=' . tl, 'POST', hdrs,
+                                     'q=' . UrlCodec.Encode(text))
+                storedArticles := this.ParseArticles(res.text)
+            } catch Error as requestError {
+                if requestError.Message ~= '^HTTP (429|403)\b' {
+                    this.romanBlockedUntil[endpointIndex] := A_TickCount + this.ROMAN_BLOCK_MS
+                    continue
+                }
+                return Map()
+            }
+            this.romanNextEndpoint := Mod(endpointIndex, this.ROMAN_ENDPOINTS.Length) + 1
+            sessionCache := this.articleSessionCache
+            (sessionCache.Count >= this.ARTICLE_SESSION_MAX && sessionCache.Clear())
+            sessionCache[sl . '|' . tl . '|' . text] := storedArticles
+            (storedArticles != '' && this.HasOwnProp('cache') && this.cache.SetArticles(text, sl, tl, storedArticles))
+            return this.ArticlesFromString(storedArticles)
+        }
+        return Map()
+    }
+
+    ; The articles of an answer of dt=bd with dj=1, as they are kept: a line
+    ; "variant<Tab>article" per noun that has one.
+    ; {"dict": [{"pos": "noun", "pos_enum": 1,
+    ;            "entry": [{"word": "Tisch", "previous_word": "der", ...}]}]}
+    static ParseArticles(json) {
+        static POS_NOUN := 1
+        IsJsonObject(value) => IsObject(value) && !(value is Array)   ; LightJson: a LinkedOrderedMap
+        answer := LightJson.Parse(json)
+        storedArticles := ''
+        if !IsJsonObject(answer) || !answer.Has('dict') || !(answer['dict'] is Array) {
+            return ''
+        }
+        for posGroup in answer['dict'] {
+            if !IsJsonObject(posGroup) || !posGroup.Has('entry') || !posGroup.Has('pos_enum')
+                    || posGroup['pos_enum'] != POS_NOUN || !(posGroup['entry'] is Array) {
+                continue
+            }
+            for dictEntry in posGroup['entry'] {
+                if IsJsonObject(dictEntry) && dictEntry.Has('word') && dictEntry.Has('previous_word')
+                        && dictEntry['previous_word'] != '' && !InStr(dictEntry['word'], '`t') {
+                    storedArticles .= dictEntry['word'] . '`t' . dictEntry['previous_word'] . '`n'
+                }
+            }
+        }
+        return RTrim(storedArticles, '`n')
+    }
+
+    static ArticlesFromString(storedArticles) {
+        articleMap := Map()
+        for articleLine in StrSplit(storedArticles, '`n') {
+            articleParts := StrSplit(articleLine, '`t')
+            (articleParts.Length == 2 && articleMap[articleParts[1]] := articleParts[2])
+        }
+        return articleMap
+    }
+
     static TranslatePage(text, tl, sl := 'auto') {
         static hdrs := Map(
                   'X-Goog-API-Key', Config.API_KEYS.translatePage,
@@ -2029,6 +2155,10 @@ class GoogleTranslator
               sourceText: 'Source Language' },
             { propertyName: 'tlTranslatedText'        , iniKey: 'Target Language', tipIcon: '',
               sourceText: 'Target Language' },
+            ; The label of the source language while it shows the language
+            ; the program detected (TranslateWindow.SetSourceDetected).
+            { propertyName: 'detectedTranslatedText'  , iniKey: 'Detected Language', tipIcon: '',
+              sourceText: 'Detected Language' },
             { propertyName: 'audioErrorTranslatedText', iniKey: 'Audio Error'    , tipIcon: '',
               sourceText: 'Playback error: unsupported language for TTS.' },
             { propertyName: 'fontSizeTranslatedText'  , iniKey: 'Font Size'      , tipIcon: '',
@@ -2039,6 +2169,9 @@ class GoogleTranslator
               sourceText: 'Swap languages' },
             { propertyName: 'swapAutoNoticeText'      , iniKey: 'Swap Auto Notice', tipIcon: '',
               sourceText: 'Select a specific source language to swap languages.' },
+            ; The tooltip of the label of a detected source language.
+            { propertyName: 'detectedTipText'         , iniKey: 'Detected Tip'   , tipIcon: '',
+              sourceText: 'Detected automatically. Select a language in the list to use it for new texts.' },
             { propertyName: 'playTipText'             , iniKey: 'Play Tip'       , tipIcon: 'play',
               sourceText: 'Read aloud' },
             { propertyName: 'pauseTipText'            , iniKey: 'Pause Tip'      , tipIcon: 'pause',
@@ -2477,6 +2610,7 @@ class TranslateWindow
          , WS_EX_COMPOSITED := 0x02000000, WS_CLIPCHILDREN := 0x02000000   ; SetLiveLayout
          , romanizer := (text, sl) => GoogleTranslator.Romanize(text, sl)   ; replaced by the tests
          , pronouncer := (word, lang) => GoogleTranslator.Pronounce(word, lang)   ; replaced by the tests
+         , articleFetcher := (text, sl, tl) => GoogleTranslator.Articles(text, sl, tl)   ; replaced by the tests
          , PRON_GAP := 8   ; between the pronunciation and the buttons on each side of it
          , ctrlDownSinceSwap := false   ; WM_KEYDOWN: Ctrl pressed anew since the last Ctrl+Tab
          ; The romanization strips and the pronunciations lie on a tinted
@@ -2488,6 +2622,21 @@ class TranslateWindow
          , TEXT_LIGHT := 0x000000, TEXT_DARK := 0xE0E0E0
          , ROMAN_PAD_X := 6, ROMAN_PAD_Y := 3, PRON_PAD_X := 6   ; the pronunciation: as high as the buttons, the text centred
          , tintedHwnds := Map()   ; the controls WM_CTLCOLORSTATIC tints
+         ; The language labels are drawn by the program (WM_DRAWITEM): a
+         ; plate as high as the list, from LABEL_PAD_X left of the margin to
+         ; LABEL_GAP before the list (pixels at 100%), the text where a plain
+         ; label had it, level with the text of the list. The plate flashes
+         ; when the program changes the language of its row (FlashLabel):
+         ; FLASH_COLOR (the blue of the button icons) mixed into the
+         ; background up to FLASH_PEAK_*, rising for FLASH_RISE_MS, then
+         ; fading for FLASH_FADE_MS, both easing out.
+         , LABEL_PAD_X := 4, LABEL_GAP := 2, LABEL_TEXT_GAP := 5   ; LABEL_TEXT_GAP: the text to the list
+         , FLASH_COLOR := 0x3694DB, FLASH_PEAK_DARK := 0.65, FLASH_PEAK_LIGHT := 0.8
+         , FLASH_RISE_MS := 120, FLASH_FADE_MS := 1300, FLASH_TICK_MS := 15
+         , labelHwnds := Map()   ; a language label → {wnd, i}
+         , flashes := Map()      ; a flashing label → when its flash began (A_TickCount)
+         , flashTimer := ObjBindMethod(this, 'FlashTick')
+         , drawItemHooked := false
          ; Dragging the edge between the fields (FieldSplitter); false turns it off.
          , FIELD_SPLITTER := true
          , resizeParams := {wnd: ''}
@@ -2527,11 +2676,26 @@ class TranslateWindow
         this.DeleteProp('saveFontSizeTimer' . i)
     }
 
-    static ShowTranslation(sl, tl, sTxt, tTxt, newGui) {
+    ; slDetected: sl was found by detection, not chosen (SetSourceDetected).
+    ; articleSource: what the variants in tTxt are for, when they may get
+    ; articles (Show Articles, FillArticles).
+    static ShowTranslation(sl, tl, sTxt, tTxt, newGui, slDetected := false, articleSource := '') {
+        ; Articles kept from before are shown with the translation at once.
+        articleText := ''
+        if IsObject(articleSource) && GoogleTranslator.showArticles {
+            articleMap := GoogleTranslator.CachedArticles(articleSource.text, articleSource.sl, articleSource.tl, &found)
+            if found && articleMap.Count {
+                tTxt := articleText := this.TextWithArticles(articleSource, articleMap)
+            }
+        }
         if !this.guis.Count || newGui == true {
             wnd := this.AddGui(sl, tl, sTxt, tTxt)
         } else {
             wnd := newGui is Gui ? newGui : this.lastGui
+            ; The languages as they were before this translation, for
+            ; FlashChangedLabels; kept from the first call of a translation
+            ; (a request shows the window first, then the result).
+            (!IsObject(wnd.flashBefore) && wnd.flashBefore := this.LanguageRowState(wnd))
             wnd.lng1.Text := this.LangDisplayName('sl', sl)
             wnd.lng2.Text := this.LangDisplayName('tl', tl)
             ; Writing the same text again would reset the caret and the undo
@@ -2546,6 +2710,13 @@ class TranslateWindow
             wnd.edit2.Text := tTxt
             wnd.play1.Enabled := true
             (tTxt != '' && wnd.play2.Enabled := true)
+        }
+        this.SetSourceDetected(wnd, slDetected && sl != 'auto')
+        (tTxt != '' && this.FlashChangedLabels(wnd))
+        wnd.articleSource := articleSource
+        wnd.articleText := articleText
+        if IsObject(articleSource) && articleText == '' && GoogleTranslator.showArticles {
+            SetTimer(ObjBindMethod(this, 'FillArticles', wnd), -1)
         }
         this.lastSl := sl
         SetTimer wnd.waitTimer, tTxt == '' ? 300 : 0
@@ -2805,6 +2976,11 @@ class TranslateWindow
         for tintedName in ['roman1', 'roman2', 'pron1', 'pron2'] {
             (this.tintedHwnds.Has(removedWnd.%tintedName%.Hwnd) && this.tintedHwnds.Delete(removedWnd.%tintedName%.Hwnd))
         }
+        Loop 2 {
+            labelHwnd := removedWnd.txt%A_Index%.Hwnd
+            (this.labelHwnds.Has(labelHwnd) && this.labelHwnds.Delete(labelHwnd))
+            (this.flashes.Has(labelHwnd) && this.flashes.Delete(labelHwnd))
+        }
         for pronWaitTimer in removedWnd.pronWaitTimers {
             SetTimer pronWaitTimer, 0
         }
@@ -3024,6 +3200,11 @@ class TranslateWindow
 
     static CreateGui(sl, tl, sTxt, tTxt, savedSize := '') {
         static ES_NOHIDESEL := 0x100, BS_ICON := 0x40
+        ; Before the window is shown: its first paint draws the labels.
+        if !this.drawItemHooked {
+            OnMessage(0x2B, ObjBindMethod(this, 'WM_DRAWITEM'))   ; WM_DRAWITEM
+            this.drawItemHooked := true
+        }
         (sl ~= '^zh(?!-)' && sl := 'zh-TW')
         (tl ~= '^zh(?!-)' && tl := 'zh-TW')
         wnd := Gui('AlwaysOnTop LastFound Resize -MaximizeBox', 'Google Translate')
@@ -3037,16 +3218,34 @@ class TranslateWindow
 
         maxTranslatedTextWidth := Max(
             this.GetTextWidth(8, 'Verdana', GoogleTranslator.slTranslatedText . ':'),
-            this.GetTextWidth(8, 'Verdana', GoogleTranslator.tlTranslatedText . ':')
+            this.GetTextWidth(8, 'Verdana', GoogleTranslator.tlTranslatedText . ':'),
+            this.GetTextWidth(8, 'Verdana', GoogleTranslator.detectedTranslatedText . ':')
         )
         (txtWidth := maxTranslatedTextWidth < 100 ? 100 : maxTranslatedTextWidth)
+        wnd.labelTextW := txtWidth   ; the room of the label text (AlignLanguageRow)
 
         for i, lang in [GoogleTranslator.slTranslatedText, GoogleTranslator.tlTranslatedText] {
             wnd.SetFont('s8', 'Verdana')
-            wnd.txt%i% := wnd.AddText('xm y+15 Right w' . txtWidth, lang . ':')                                                 ; <————————————— Text 'Source Language', 'Target Language'
+            ; SS_OWNERDRAW: the label and its plate are drawn by WM_DRAWITEM,
+            ; AlignLanguageRow gives it its place.
+            ; SS_NOTIFY (0x100): the label gets the mouse, and its tooltip
+            ; (SetSourceDetected) sees it; a click still drags the window.
+            wnd.txt%i% := wnd.AddText('xm y+15 w' . txtWidth . ' +0x10D', lang . ':')                                     ; <————————————— Text 'Source Language', 'Target Language'
+            this.labelHwnds[wnd.txt%i%.Hwnd] := {wnd: wnd, i: i}
             lang := ['sl', 'tl'][i]
-            wnd.lng%i% := wnd.AddComboBox('x+5 yp-2 w182 Choose' . this.LangIndex(lang, i == 1 ? sl : tl), this.%lang%Arr)      ; <————————————— ComboBoxes with language selection
+            wnd.lng%i% := wnd.AddComboBox('x+' . this.LABEL_TEXT_GAP . ' yp-2 w182 Choose' . this.LangIndex(lang, i == 1 ? sl : tl), this.%lang%Arr)      ; <————————————— ComboBoxes with language selection
             wnd.lng%i%.OnEvent('Focus', ObjBindMethod(this, 'SwitchLayoutForLanguageList', wnd))
+            ; Change comes only from the user: the program's writes to the
+            ; list do not raise it (checked with a probe). A choice of the
+            ; language already shown changes nothing and may not raise it
+            ; (Enter in the open list): CBN_SELENDOK comes for any choice
+            ; made in the list. Closing the list without one (the arrow, Esc,
+            ; a click elsewhere) gives CBN_SELENDCANCEL and keeps the language
+            ; detected.
+            if i == 1 {
+                wnd.lng1.OnEvent('Change', ObjBindMethod(this, 'OnSourceLanguageChange', wnd))
+                wnd.lng1.OnCommand(9, ObjBindMethod(this, 'OnSourceLanguageChange', wnd))   ; CBN_SELENDOK
+            }
             
             wnd.swapLang%i% := wnd.AddButton('x+5 yp-1 w23 h23 ' . BS_ICON)                                                     ; <————————————— Swap language buttons
             wnd.swapLang%i%.OnEvent('Click', ObjBindMethod(this, 'SwapLanguages', wnd))
@@ -3143,6 +3342,12 @@ class TranslateWindow
         wnd.romanOwnTop := [-1, -1]     ; the top line of a field scrolled by the program (ShowSegmentInField)
         wnd.romanWheelRest := [0, 0]    ; WheelOverStrip: the part of a notch of the wheel not used yet
         wnd.romanStripH := [this.RomanStripHeight(this.fontSize[1]), this.RomanStripHeight(this.fontSize[2])]
+        wnd.slDetected := false     ; the source language was found by detection (SetSourceDetected)
+        wnd.articleSource := ''     ; what the variants of the bottom field are for (FillArticles)
+        wnd.articleText := ''       ; the text of the bottom field with the articles, as shown
+        wnd.flashBefore := ''       ; LanguageRowState before the translation being shown
+        wnd.flashReady := false     ; a translation has been shown: changes flash from now on
+        wnd.labelTextY := [0, 0]    ; the text of each label below the top of its plate (AlignLanguageRow)
         (GoogleTranslator.darkTheme && DarkTheme.SetWindowTheme(wnd))
         this.PadTintedText(wnd)   ; the theme reset the padding
         ; Above 100% the swap button gets lower (AlignLanguageRow), and the
@@ -3214,12 +3419,187 @@ class TranslateWindow
         editRect := Buffer(16)
         DllCall('GetWindowRect', 'Ptr', editHwnd, 'Ptr', editRect)
         DllCall('MapWindowPoints', 'Ptr', 0, 'Ptr', wnd.Hwnd, 'Ptr', editRect, 'UInt', 2)
+        ; The label is the plate (WM_DRAWITEM): as high as the list, from a
+        ; little before the room of the text (a little left of the margin) to
+        ; a little before the list. Counted from the list: in a wide window
+        ; ResizeHorizontal centres the row. The text stays level with the
+        ; text of the list.
+        scale := A_ScreenDPI / 96
         labelRect := this.ClientRect(wnd.txt%i%)
-        labelTop := NumGet(editRect, 4, 'Int')
-        if labelRect.top != labelTop {
-            DllCall('SetWindowPos', 'Ptr', wnd.txt%i%.Hwnd, 'Ptr', 0, 'Int', labelRect.left, 'Int', labelTop,
-                    'Int', 0, 'Int', 0, 'UInt', SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
+        plateLeft := comboRect.left
+                     - Round((wnd.labelTextW + this.LABEL_TEXT_GAP + this.LABEL_PAD_X) * scale)
+        plateRight := comboRect.left - Round(this.LABEL_GAP * scale)
+        textY := NumGet(editRect, 4, 'Int') - comboRect.top
+        if labelRect.left != plateLeft || labelRect.top != comboRect.top
+                || labelRect.right != plateRight || labelRect.bottom != comboRect.bottom {
+            DllCall('SetWindowPos', 'Ptr', wnd.txt%i%.Hwnd, 'Ptr', 0, 'Int', plateLeft, 'Int', comboRect.top,
+                    'Int', plateRight - plateLeft, 'Int', comboRect.bottom - comboRect.top,
+                    'UInt', SWP_NOZORDER | SWP_NOACTIVATE)
         }
+        if wnd.labelTextY[i] != textY {
+            wnd.labelTextY[i] := textY
+            DllCall('InvalidateRect', 'Ptr', wnd.txt%i%.Hwnd, 'Ptr', 0, 'Int', false)
+        }
+    }
+
+    ; Draws a language label (SS_OWNERDRAW): the plate in the colour of the
+    ; window, mixed with the flash while it lasts (FlashAmount), and the
+    ; text, right-aligned where a plain label had it and level with the text
+    ; of the list (labelTextY). Drawn in memory and put on the label in one
+    ; BitBlt: drawn on the label itself, the plate and the text came in two
+    ; steps, and a frame of the screen between them showed the plate without
+    ; the text (the text blinked while the plate flashed).
+    static WM_DRAWITEM(wParam, lParam, msg, hwnd) {
+        static ODT_STATIC := 5, COLOR_WINDOWTEXT := 8, COLOR_BTNFACE := 15, TRANSPARENT := 1
+             , DT_RIGHT := 0x2, DT_SINGLELINE := 0x20, DT_NOPREFIX := 0x800, WM_GETFONT := 0x31
+             , SRCCOPY := 0xCC0020
+        if NumGet(lParam, 0, 'UInt') != ODT_STATIC {
+            return
+        }
+        labelHwnd := NumGet(lParam, 16 + A_PtrSize, 'Ptr')     ; hwndItem
+        if !this.labelHwnds.Has(labelHwnd) {
+            return
+        }
+        labelInfo := this.labelHwnds[labelHwnd]
+        hdc := NumGet(lParam, 16 + A_PtrSize * 2, 'Ptr')       ; hDC
+        rectOffset := 16 + A_PtrSize * 3                        ; rcItem
+        plateX := NumGet(lParam, rectOffset, 'Int')
+        plateY := NumGet(lParam, rectOffset + 4, 'Int')
+        plateW := NumGet(lParam, rectOffset + 8, 'Int') - plateX
+        plateH := NumGet(lParam, rectOffset + 12, 'Int') - plateY
+        if plateW <= 0 || plateH <= 0 {
+            return true
+        }
+        dark := DarkTheme.DarkByHwnd.Has(hwnd) && DarkTheme.DarkByHwnd[hwnd]
+        backgroundColor := dark ? DarkTheme.DarkColors['Background']
+                                : this.RgbToBgr(DllCall('GetSysColor', 'Int', COLOR_BTNFACE, 'UInt'))
+        textColor := dark ? this.TEXT_DARK
+                          : this.RgbToBgr(DllCall('GetSysColor', 'Int', COLOR_WINDOWTEXT, 'UInt'))
+        peak := dark ? this.FLASH_PEAK_DARK : this.FLASH_PEAK_LIGHT
+        plateColor := this.MixColor(backgroundColor, this.FLASH_COLOR, this.FlashAmount(labelHwnd) * peak)
+        labelText := labelInfo.wnd.txt%labelInfo.i%.Text
+        textY := labelInfo.wnd.HasOwnProp('labelTextY') ? labelInfo.wnd.labelTextY[labelInfo.i] : 0
+        scale := A_ScreenDPI / 96
+        plateRect := Buffer(16)
+        NumPut('Int', 0, 'Int', 0, 'Int', plateW, 'Int', plateH, plateRect)
+        textRect := Buffer(16)
+        NumPut('Int', 0, 'Int', textY,
+               'Int', plateW - (Round(this.LABEL_TEXT_GAP * scale) - Round(this.LABEL_GAP * scale)),
+               'Int', plateH, textRect)
+        labelFont := SendMessage(WM_GETFONT, 0, 0, labelHwnd)
+
+        memDC := DllCall('CreateCompatibleDC', 'Ptr', hdc, 'Ptr')
+        memBitmap := DllCall('CreateCompatibleBitmap', 'Ptr', hdc, 'Int', plateW, 'Int', plateH, 'Ptr')
+        oldBitmap := DllCall('SelectObject', 'Ptr', memDC, 'Ptr', memBitmap, 'Ptr')
+        DllCall('SetDCBrushColor', 'Ptr', memDC, 'UInt', this.RgbToBgr(plateColor), 'UInt')
+        DllCall('FillRect', 'Ptr', memDC, 'Ptr', plateRect, 'Ptr', DllCall('GetStockObject', 'Int', 18, 'Ptr'))   ; DC_BRUSH
+        oldFont := DllCall('SelectObject', 'Ptr', memDC, 'Ptr', labelFont, 'Ptr')
+        DllCall('SetBkMode', 'Ptr', memDC, 'Int', TRANSPARENT)
+        DllCall('SetTextColor', 'Ptr', memDC, 'UInt', this.RgbToBgr(textColor))
+        DllCall('DrawText', 'Ptr', memDC, 'Str', labelText, 'Int', -1, 'Ptr', textRect,
+                'UInt', DT_RIGHT | DT_SINGLELINE | DT_NOPREFIX)
+        DllCall('BitBlt', 'Ptr', hdc, 'Int', plateX, 'Int', plateY, 'Int', plateW, 'Int', plateH,
+                'Ptr', memDC, 'Int', 0, 'Int', 0, 'UInt', SRCCOPY)
+        DllCall('SelectObject', 'Ptr', memDC, 'Ptr', oldFont, 'Ptr')
+        DllCall('SelectObject', 'Ptr', memDC, 'Ptr', oldBitmap, 'Ptr')
+        DllCall('DeleteObject', 'Ptr', memBitmap)
+        DllCall('DeleteDC', 'Ptr', memDC)
+        return true
+    }
+
+    ; An RGB colour amount (0 to 1) of the way from one colour to another.
+    static MixColor(fromColor, toColor, amount) {
+        mixed := 0
+        for shift in [16, 8, 0] {
+            fromPart := fromColor >> shift & 0xFF
+            toPart := toColor >> shift & 0xFF
+            mixed |= Round(fromPart + (toPart - fromPart) * amount) << shift
+        }
+        return mixed
+    }
+
+    ; Flashes the plate of a language label: the program has changed what
+    ; the row shows. A new flash of a flashing label starts over.
+    static FlashLabel(wnd, i) {
+        labelHwnd := wnd.txt%i%.Hwnd
+        this.flashes[labelHwnd] := A_TickCount
+        SetTimer(this.flashTimer, this.FLASH_TICK_MS)
+        DllCall('InvalidateRect', 'Ptr', labelHwnd, 'Ptr', 0, 'Int', false)
+    }
+
+    ; How much of the flash a label shows now, 0 to 1. Counted from the
+    ; time, not from the ticks: a late tick skips a frame instead of
+    ; stretching the flash (the program is busy just when it begins).
+    static FlashAmount(labelHwnd) {
+        if !this.flashes.Has(labelHwnd) {
+            return 0
+        }
+        elapsed := A_TickCount - this.flashes[labelHwnd]
+        if elapsed < this.FLASH_RISE_MS {
+            progress := elapsed / this.FLASH_RISE_MS
+            return 1 - (1 - progress) ** 2
+        }
+        progress := Min(1, (elapsed - this.FLASH_RISE_MS) / this.FLASH_FADE_MS)
+        return (1 - progress) ** 2
+    }
+
+    static FlashTick() {
+        for labelHwnd, flashStart in this.flashes.Clone() {
+            if A_TickCount - flashStart >= this.FLASH_RISE_MS + this.FLASH_FADE_MS {
+                this.flashes.Delete(labelHwnd)   ; drawn below in the colour of the window
+            }
+            DllCall('InvalidateRect', 'Ptr', labelHwnd, 'Ptr', 0, 'Int', false)
+        }
+        (!this.flashes.Count && SetTimer(this.flashTimer, 0))
+    }
+
+    ; What the language row shows: the two languages and whether the source
+    ; one was detected.
+    static LanguageRowState(wnd) => [wnd.lng1.Text, wnd.lng2.Text, wnd.slDetected]
+
+    ; After a translation is shown: flashes the label of each row whose
+    ; language the program has changed since the translation began
+    ; (flashBefore). A window showing its first translation has just
+    ; appeared as a whole: only a detected source language is pointed out.
+    static FlashChangedLabels(wnd) {
+        rowBefore := wnd.flashBefore
+        wnd.flashBefore := ''
+        if !wnd.flashReady {
+            wnd.flashReady := true
+            (wnd.slDetected && this.FlashLabel(wnd, 1))
+            return
+        }
+        if !IsObject(rowBefore) {
+            return
+        }
+        rowNow := this.LanguageRowState(wnd)
+        (rowBefore[1] !== rowNow[1] || rowBefore[3] != rowNow[3]) && this.FlashLabel(wnd, 1)
+        (rowBefore[2] !== rowNow[2]) && this.FlashLabel(wnd, 2)
+    }
+
+    ; Whether the source language of a window was found by detection. Such
+    ; a language is only shown: the next text is detected anew, and the label
+    ; says so. A language the user chose stays until he changes it.
+    static SetSourceDetected(wnd, detected) {
+        wnd.slDetected := detected
+        labelText := (detected ? GoogleTranslator.detectedTranslatedText : GoogleTranslator.slTranslatedText) . ':'
+        if wnd.txt1.Text !== labelText {
+            wnd.txt1.Text := labelText
+            DllCall('InvalidateRect', 'Ptr', wnd.txt1.Hwnd, 'Ptr', 0, 'Int', false)
+        }
+        ; The label of a detected language says how to keep one.
+        if wnd.HasOwnProp('buttonHints') {
+            if detected {
+                wnd.buttonHints.SetText(wnd.txt1, GoogleTranslator.InterfaceTextOrSource('detectedTipText'))
+            } else {
+                wnd.buttonHints.RemoveTool(wnd.txt1)
+            }
+        }
+    }
+
+    ; The user chose a source language (or typed one): it stays.
+    static OnSourceLanguageChange(wnd, *) {
+        this.SetSourceDetected(wnd, false)
     }
 
     ; The rectangle of a control in the client coordinates of its window, in pixels.
@@ -3341,17 +3721,24 @@ class TranslateWindow
         txt2 := wnd.lng%direction == 'forward' ? 2 : 1%.Text
         sl := this.LangNameToCode(txt1)
         tl := this.LangNameToCode(txt2)
-        ; An empty or unknown language name lets Google detect the source.
-        if sl == '' {
+        ; An empty or unknown language name lets Google detect the source,
+        ; and so does a language detected for the previous text: the text
+        ; may have changed. A language the user chose stays.
+        if sl == '' || direction == 'forward' && wnd.slDetected {
             sl := 'auto'
         }
         if (tl == 'auto' || tl == '') {
             tl := this.lastSl ? this.lastSl : GoogleTranslator.nativeLanguage
         }
         if direction == 'backward' {
+            ; The language of the lower field is known, not detected.
+            this.SetSourceDetected(wnd, false)
             wnd.lng1.Text := txt1
             wnd.lng2.Text := txt2
         }
+        ; A change of the languages is measured from what the user sees now.
+        wnd.flashBefore := this.LanguageRowState(wnd)
+        wnd.flashReady := true
         GoogleTranslator.Translate(text, tl, sl, wnd)
     }
 
@@ -4069,6 +4456,144 @@ class TranslateWindow
         this.ShowPronunciation(wnd, i, wnd.pronWord[i] . ' ' . SubStr('...', 1, wnd.pronDots[i]))
     }
 
+    ; Puts the articles of the nouns into the variants of the bottom field
+    ; once Google gives them (Show Articles). Only if the field still has the
+    ; text it was given: not over another translation or the user's edit.
+    ; The main translation stays as it is: it is what is copied and pasted.
+    static FillArticles(wnd) {
+        static EM_GETFIRSTVISIBLELINE := 0xCE, EM_LINESCROLL := 0xB6
+        articleSource := wnd.articleSource
+        if !this.IsAlive(wnd) || !GoogleTranslator.showArticles || !IsObject(articleSource) {
+            return
+        }
+        plainText := this.TextWithArticles(articleSource, Map())
+        if !this.SameFieldText(wnd.edit2.Text, plainText) {
+            return
+        }
+        articleMap := (this.articleFetcher)(articleSource.text, articleSource.sl, articleSource.tl)
+        if !articleMap.Count || !this.IsAlive(wnd) || !GoogleTranslator.showArticles
+                || wnd.articleSource !== articleSource || !this.SameFieldText(wnd.edit2.Text, plainText) {
+            return
+        }
+        articleText := this.TextWithArticles(articleSource, articleMap)
+        if articleText == plainText {
+            return
+        }
+        topLine := SendMessage(EM_GETFIRSTVISIBLELINE, 0, 0, wnd.edit2)
+        wnd.edit2.Text := articleText
+        wnd.articleText := articleText
+        (topLine && SendMessage(EM_LINESCROLL, 0, topLine, wnd.edit2))
+    }
+
+    ; The text of the bottom field: the main translation and the variants,
+    ; the nouns among them with their articles.
+    static TextWithArticles(articleSource, articleMap) {
+        return articleSource.main . '`r`n`r`n'
+            . this.ApplyArticles(articleSource.variants, articleMap, articleSource.tl, articleSource.main)
+    }
+
+    static SameFieldText(fieldText, text) => StrReplace(fieldText, '`r`n', '`n') == StrReplace(text, '`r`n', '`n')
+
+    ; The variants (a word a line, groups of a part of speech apart by a
+    ; blank line) with the articles of their nouns. The groups come without
+    ; the part of speech, and a word may be a noun and a verb ("il potere",
+    ; "potere"): only a group more than half of whose words are nouns of the
+    ; answer gets them. The main translation stays without an article (it is
+    ; what is copied and pasted); when its article is known, the word comes
+    ; again with it first among the variants ("Tisch": "der Tisch" first, and
+    ; not again further down its group). Google's main translation is often
+    ; not in its dictionary ("авторучка": "Stift", the dictionary only has
+    ; "Füller"): then its article is not known, and nothing is added.
+    static ApplyArticles(variants, articleMap, tl, mainText := '') {
+        if !articleMap.Count {
+            return variants
+        }
+        ; The word of the main translation as the dictionary has it: "Mesa"
+        ; at the start of a translation is "mesa" there.
+        mainWord := ''
+        mainKey := StrLower(this.PronunciationWord(mainText))
+        if mainKey != '' && !InStr(mainText, '`n') {
+            for dictWord in articleMap {
+                if StrLower(dictWord) == mainKey {
+                    mainWord := dictWord
+                    break
+                }
+            }
+        }
+        groups := []
+        for variantGroup in StrSplit(StrReplace(variants, '`r`n', '`n'), '`n`n') {
+            groupWords := StrSplit(variantGroup, '`n')
+            nounCount := 0
+            for variantWord in groupWords {
+                (articleMap.Has(variantWord) && nounCount++)
+            }
+            nounGroup := nounCount * 2 > groupWords.Length
+            shownWords := []
+            for variantWord in groupWords {
+                if nounGroup && articleMap.Has(variantWord) {
+                    if mainWord != '' && StrLower(variantWord) == StrLower(mainWord) {
+                        continue   ; it comes first
+                    }
+                    variantWord := this.ArticleForm(articleMap[variantWord], variantWord, tl)
+                }
+                shownWords.Push(variantWord)
+            }
+            groups.Push({words: shownWords, nouns: nounGroup})
+        }
+        if mainWord != '' {
+            mainLine := this.ArticleForm(articleMap[mainWord], mainWord, tl)
+            ; First in the group of nouns if that is the first group, or a
+            ; group of its own above the others.
+            if groups.Length && groups[1].nouns {
+                groups[1].words.InsertAt(1, mainLine)
+            } else {
+                groups.InsertAt(1, {words: [mainLine], nouns: true})
+            }
+        }
+        result := ''
+        for shownGroup in groups {
+            if !shownGroup.words.Length {
+                continue
+            }
+            (result != '' && result .= '`n`n')
+            for variantWord in shownGroup.words {
+                result .= (A_Index > 1 ? '`n' : '') . variantWord
+            }
+        }
+        return StrReplace(result, '`n', '`r`n')
+    }
+
+    ; An article with its word. Google gives Italian and French articles
+    ; without the elision ("il elenco"): before a vowel they become "l'".
+    ; Before h only in Italian: in French h may be aspirated ("le héros").
+    static ArticleForm(article, word, tl) {
+        static ELIDED := Map('it', Map('il', true, 'lo', true, 'la', true),
+                             'fr', Map('le', true, 'la', true))
+        if article ~= "['’]$" {
+            return article . word
+        }
+        if ELIDED.Has(tl) && ELIDED[tl].Has(StrLower(article))
+                && word ~= (tl == 'it' ? 'i)^[aeiouhàèéìíòóùú]' : 'i)^[aeiouàâäéèêëîïôöùûüæœ]') {
+            return (SubStr(article, 1, 1) == 'L' ? 'L' : 'l') . "'" . word
+        }
+        return article . ' ' . word
+    }
+
+    ; Show Articles turned on or off: the open windows follow at once.
+    static OnArticlesToggled() {
+        for hwnd, wnd in this.guis {
+            if !wnd.HasOwnProp('articleSource') || !IsObject(wnd.articleSource) {
+                continue
+            }
+            if GoogleTranslator.showArticles {
+                SetTimer(ObjBindMethod(this, 'FillArticles', wnd), -1)
+            } else if wnd.articleText != '' && this.SameFieldText(wnd.edit2.Text, wnd.articleText) {
+                wnd.edit2.Text := this.TextWithArticles(wnd.articleSource, Map())
+                wnd.articleText := ''
+            }
+        }
+    }
+
     ; Show Pronunciation turned on or off: the open windows follow at once.
     static OnPronunciationToggled() {
         for hwnd, wnd in this.guis {
@@ -4129,6 +4654,9 @@ class TranslateWindow
             }
             return
         }
+        ; A detected source language goes down like a chosen one; the target
+        ; language comes up as known.
+        this.SetSourceDetected(wnd, false)
         targetLang := wnd.lng2.Text
         wnd.lng1.Text := targetLang
         wnd.lng2.Text := sourceLang
@@ -6387,6 +6915,7 @@ class TranslationCache {
     static TYPE_TRANSLATION := 'T'
          , TYPE_AUDIO       := 'A'
          , TYPE_ROMAN       := 'R'   ; the romanization of a text (Show Romanization)
+         , TYPE_ARTICLES    := 'N'   ; the articles of the nouns among the variants (Show Articles)
          , DEFAULT_MAX_SIZE := 100 * 1024 * 1024  ; 100 MB
 
     db := ''
@@ -6547,6 +7076,33 @@ class TranslationCache {
         return true
     }
 
+    ; The articles of the variants of a word (GoogleTranslator.ParseArticles),
+    ; or an empty string. Only found ones are stored.
+    GetArticles(text, sl, tl) {
+        key := this._MakeArticlesKey(text, sl, tl)
+        data := this.db.Get(key, &found := false)
+        if !found {
+            this._DeleteInvalidRecord(key)
+            return ''
+        }
+        storedArticles := data is Buffer ? StrGet(data, data.Size, 'UTF-8') : String(data)
+        if storedArticles == '' {
+            this._DeleteInvalidRecord(key)
+        }
+        return storedArticles
+    }
+
+    SetArticles(text, sl, tl, storedArticles) {
+        if storedArticles == '' {
+            return false
+        }
+        try this.db.Set(this._MakeArticlesKey(text, sl, tl), this._StringToUTF8(storedArticles))
+        catch {
+            return false
+        }
+        return true
+    }
+
     HasTranslation(text, sl, tl) {
         key := this._MakeTranslationKey(text, sl, tl)
         if this.lastTranslation && this.lastTranslation.key == key {
@@ -6644,6 +7200,11 @@ class TranslationCache {
         return TranslationCache.TYPE_ROMAN . this._Hash(source)
     }
 
+    _MakeArticlesKey(text, sl, tl) {
+        source := text . '|' . sl . '|' . tl
+        return TranslationCache.TYPE_ARTICLES . this._Hash(source)
+    }
+
     _MakeAudioKey(text, lang) {
         source := text . '|' . lang
         return TranslationCache.TYPE_AUDIO . this._Hash(source)
@@ -6688,6 +7249,8 @@ class DisabledTranslationCache
     SetAudio(*) => false
     GetRoman(*) => ''
     SetRoman(*) => false
+    GetArticles(*) => ''
+    SetArticles(*) => false
     HasTranslation(*) => false
     HasAudio(*) => false
     Clear() => ''
@@ -8061,6 +8624,18 @@ class ButtonToolTips
         }
     }
 
+    ; Removes the tooltip of a control, if it has one.
+    RemoveTool(ctrl) {
+        static TTF_IDISHWND := 0x1, TTM_DELTOOLW := 0x433
+        if !this.toolHwnds.Has(ctrl.Hwnd) {
+            return
+        }
+        toolInfo := Buffer(24 + A_PtrSize * 6, 0)   ; TTTOOLINFOW
+        NumPut('UInt', toolInfo.Size, 'UInt', TTF_IDISHWND, 'Ptr', this.ownerHwnd, 'Ptr', ctrl.Hwnd, toolInfo)
+        SendMessage(TTM_DELTOOLW, 0, toolInfo, this.hwnd)
+        this.toolHwnds.Delete(ctrl.Hwnd)
+    }
+
     ; Shows a message under a control for a while. It is a tracking tool of the
     ; same tooltip control, so it has the colors of the window's tooltips and
     ; is shown at once, wherever the mouse pointer is. Its right edge is under
@@ -8521,7 +9096,7 @@ class Icons
 class Config {
     ; Keep in sync with ;@Ahk2Exe-SetVersion at the top of the script:
     ; Tools\BuildRelease.ps1 refuses to build when they differ.
-    static VERSION := '1.3.0'
+    static VERSION := '1.4.0'
 
     ; Public keys built into Google's own browser-side clients (Google Translate
     ; website translation and the Google Dictionary extension). They are not the
